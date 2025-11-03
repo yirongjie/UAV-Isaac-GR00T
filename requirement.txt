@@ -1,0 +1,55 @@
+# -----------------------------------------------------------------
+# 核心依赖 (来自 [project].dependencies)
+# 移除了: opencv_python_headless (与orin组冲突), wandb, ray, tianshou, pytest, matplotlib
+# -----------------------------------------------------------------
+albumentations==1.4.18
+av==12.3.0
+blessings==1.7
+dm_tree==0.1.8
+einops==0.8.1
+gymnasium==1.0.0
+h5py==3.11.0                # 降级 (原为 3.12.1)
+hydra-core==1.3.2
+imageio==2.34.2
+kornia
+numpy>=1.23.5,<=1.26.4        # 明确 Python 3.8 的上限
+# numpydantic
+omegaconf==2.3.0
+pandas
+pydantic==2.10.6
+PyYAML==6.0.2
+Requests==2.32.3
+timm==1.0.14
+tqdm==4.67.1
+transformers
+typing_extensions==4.12.2
+pyarrow==11.0.0             # 降级 (原为 14.0.1)
+fastparquet==2023.10.1      # 降级 (原为 2024.11.0)
+accelerate==0.21.0          # 降级 (原为 1.2.1)
+peft==0.8.2                 # 降级 (原为 0.17.0)
+protobuf==3.20.3
+onnx==1.15.0                # 降级 (原为 1.17.0)
+tyro
+
+# -----------------------------------------------------------------
+# 基础和Orin特定依赖 (来自 [optional-dependencies].base 和 .orin)
+# 移除了: torch, torchvision, tensorflow
+# -----------------------------------------------------------------
+#decord==0.6.0; platform_system != 'Darwin'
+#pyzmq
+#pytorch3d
+diffusers==0.30.2
+#opencv_python==4.8.0.74
+#triton==3.4.0
+#flash-attn==2.8.2
+#iopath==0.1.9
+#pycuda
+#nvtx
+
+# -----------------------------------------------------------------
+# HTTP服务器额外依赖 (来自 inference_service.py 的说明)
+# 运行您的 inference_uav_flow.sh 所必需
+# -----------------------------------------------------------------
+uvicorn
+fastapi
+json-numpy

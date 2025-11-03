@@ -1,0 +1,3 @@
+# PYTHONWARNINGS="ignore::UserWarning" /home/shrelic/miniforge3/envs/gr00t/bin/python scripts/inference_service.py --host 0.0.0.0 --server --http-server --data_config examples.UAV_Flow.custom_data_config:UAVFlowDataConfig --embodiment_tag new_embodiment --denoising_steps 16 --model_path /home/shrelic/projects/Isaac-GR00T/UAV-Gr00t-004
+
+PYTHONWARNINGS="ignore::UserWarning" python3.8 scripts/inference_service.py --host 0.0.0.0 --server --http-server --data_config examples.UAV_Flow.custom_data_config:UAVFlowDataConfig --embodiment_tag new_embodiment --denoising_steps 16 --model_path /open_app/UAV-Gr00t-004
