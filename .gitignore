@@ -5,3 +5,6 @@ uav_script/logs_vla
 uav_script/dynamic_mission.kmz
 .vscode
 .idea
+current_frame.png
+gr00t.egg-info/*.txt
+gr00t.egg-info/*

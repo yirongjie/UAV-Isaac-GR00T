@@ -16,6 +16,14 @@ import datetime
 import queue # [!!] 确保导入
 import typing # Este import não é mais estritamente necessário, mas inofensivo
 
+import signal # [!!] 用于 Ctrl+C
+import sys    # [!!] 新增：用于 tty/termios
+import tty    # [!!] 新增：用于终端控制
+import termios # [!!] 新增：用于终端控制
+
+# [!!] 移除: pynput (导致崩溃)
+# from pynput import keyboard 
+
 # 仅在启用语音时才需要这些模块
 # (此部分保持不变)
 try:
@@ -35,91 +43,18 @@ DRONE_TYPE = "djim4d"
 # ssh -L 5555:localhost:5555 yrj@10.29.230.87
 # ssh -L 5007:localhost:5007 yrj@10.109.246.210 -p 20212
 
-# [!! PERUBAHAN !!] Impor Gr00tLocalClient yang baru
 from policy_client import OpenVLAClient, Gr00tClient, Gr00tLocalClient
-# from tello_smol_wrapper import Drone
 from DJI_M4D_smol_wrapper import DjiM4DDrone
 
 # --- 线程协调事件 ---
-stop_event = threading.Event()
-
-# [!!] (Fungsi 'keep_tello_alive', 'drone_live_feed', 'get_vla_proprio', 'convert_openvla_poses_to_deltas', dan 'llm_inference_wrapper' tetap TIDAK BERUBAH)
-# ...
-# (Menyalin fungsi-fungsi yang tidak berubah untuk kelengkapan)
-# ...
-
-# def keep_tello_alive(drone_instance: Drone):
-#     """定期发送命令防止 Tello 自动降落。"""
-#     if DRONE_TYPE != "tello":
-#         print("[Keepalive] M4D 无人机不需要 Keepalive 线程。线程退出。")
-#         return
-        
-#     while not stop_event.is_set():
-#         try:
-#             battery = drone_instance.get_battery()
-#             print("[Keepalive] Battery: {}%".format(battery))
-#         except Exception as e:
-#             print("[Keepalive] 错误: {}".format(e))
-#         stop_event.wait(8)
-#     print("[Keepalive] 线程已停止。")
-
-
-def drone_live_feed(drone_instance):
-    """
-    为实体无人机显示实时视频流的线程，并保存为 mp4 文件。
-    """
-    print("[LiveFeed] 正在启动视频流...")
-    log_dir = "logs_vla"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    # 修改后的版本
-    video_path = os.path.join(log_dir, "{}_VLA_Feed.mp4".format(ts))
-    video_writer = None
-
-    EXPECTED_W = 480
-    EXPECTED_H = 360
-    
-    try:
-        while not stop_event.is_set():
-            frame_rgb = drone_instance.get_frame() 
-            if frame_rgb is None or frame_rgb.size == 0:
-                print("[LiveFeed] 未能获取到有效的视频帧，跳过...")
-                stop_event.wait(0.1)
-                continue
-
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            h, w = frame_bgr.shape[:2]
-            if w != EXPECTED_W or h != EXPECTED_H:
-                frame_bgr = cv2.resize(frame_bgr, (EXPECTED_W, EXPECTED_H))
-
-            if video_writer is None:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                video_writer = cv2.VideoWriter(video_path, fourcc, 30, (EXPECTED_W, EXPECTED_H))
-            
-            video_writer.write(frame_bgr)
-            cv2.imshow("Drone Live Feed (VLA)", frame_bgr)
-
-            if cv2.waitKey(30) & 0xFF == ord("q"):
-                print("[LiveFeed] 用户通过 'q' 键停止了视频流")
-                stop_event.set()
-                break
-
-    except Exception as e:
-        print(u"[LiveFeed] 视频流发生错误: {}".format(e))
-    finally:
-        cv2.destroyAllWindows()
-        if video_writer is not None:
-            video_writer.release()
-            print(u"[LiveFeed] 视频已保存到: {}".format(video_path))
-        print("[LiveFeed] 视频流线程已终止。")
-        stop_event.set()
+program_stop_event = threading.Event() # 用于 Ctrl+C 或 'q' 退出整个程序
+round_interrupt_event = threading.Event() # 用于 'i' 中断当前轮次
 
 
 def get_vla_proprio(drone):
     """
     获取无人机当前姿态,并转换为VLA模型所需的proprio格式。
+    (此函数未更改)
     """
     pose = drone.get_current_pose()
     
@@ -136,6 +71,7 @@ def get_vla_proprio(drone):
 def convert_openvla_poses_to_deltas(poses_frd_ccw_rad):
     """
     将 OpenVLA 的姿态序列 (相对于起点) 转换为 Tello 需要的增量序列。
+    (此函数未更改)
     """
     deltas_frd_cw_deg = []
     last_pose_frd_ccw_deg = np.array([0.0, 0.0, 0.0, 0.0])
@@ -165,9 +101,7 @@ def llm_inference_wrapper(drone, client, instruction, args,
                           out_data):
     """
     在一个单独的线程中运行 VLA 推理。
-    获取当前帧, 调用 client.get_action(), 并将结果放入 out_data 字典中。
-    (Fungsi ini tidak perlu diubah karena 'client' adalah abstraksi
-    yang berfungsi untuk Gr00tClient, Gr00tLocalClient, dan OpenVLAClient)
+    (此函数未更改)
     """
     try:
         # 1. 获取当前状态 (图像 + 姿态)
@@ -224,11 +158,12 @@ def llm_inference_wrapper(drone, client, instruction, args,
         out_data['error'] = str(e)
 
 
-# [!!] MODIFICADO: Anotações de tipo removidas
-def main_vla_logic(drone, client, instruction, args):
+# [!!] MODIFICADO: 签名已更改以接受事件
+def main_vla_logic(drone, client, instruction, args, program_stop_event, round_interrupt_event):
     """
-    VLA 控制的主逻辑 (流水线版本)，在一个单独的线程中运行。
-    (Fungsi ini juga não perlu diubah)
+    VLA 控制的主逻辑 (流水线版本)。
+    [!!] 现在检查 program_stop_event (Ctrl+C / 'q') 和 round_interrupt_event ('i')。
+    (此函数未更改)
     """
     
     llm_thread = None
@@ -237,13 +172,24 @@ def main_vla_logic(drone, client, instruction, args):
     first_image = None
     step_count = 0
 
+    # [!!] 创建一个本地中断错误，以便我们可以优雅地捕获它
+    class RoundInterruptedError(Exception):
+        pass
+
     try:
         # --- 自动起飞 ---
         print("[VLA] 正在起飞...")
         # [!!] MODIFIED: Replaced f-string with .format() (in commented line)
         # drone.talk("收到指令: {}。准备起飞。".format(instruction))
         drone.take_off()
-        time.sleep(5) # 等待稳定
+        
+        # [!!] MODIFIED: 使睡眠可中断
+        start_sleep = time.time()
+        while time.time() - start_sleep < 5:
+            if program_stop_event.is_set() or round_interrupt_event.is_set():
+                raise RoundInterruptedError("在起飞等待时中断")
+            time.sleep(0.1) # 等待稳定
+            
         print("[VLA] 无人机已起飞。")
         
         # --- VLA 持续控制循环 ---
@@ -252,26 +198,34 @@ def main_vla_logic(drone, client, instruction, args):
 
         # 1. [!!] 获取第一帧图像 (用于 VLA)
         first_image_rgb = drone.get_frame()
-        while first_image_rgb is None and not stop_event.is_set():
+        # [!!] MODIFIED: 添加了中断检查
+        while first_image_rgb is None and not (program_stop_event.is_set() or round_interrupt_event.is_set()):
                 print("[VLA] 警告: 无法获取第一帧图像，正在重试...")
-                stop_event.wait(0.5)
+                # [!!] MODIFIED: 使用事件的 wait 方法
+                if program_stop_event.wait(0.5): break # program_stop_event 被设置
+                if round_interrupt_event.wait(0.01): break # round_interrupt_event 被设置
                 first_image_rgb = drone.get_frame()
         
-        if stop_event.is_set():
-                raise InterruptedError("在获取第一帧图像时程序被终止")
+        if program_stop_event.is_set() or round_interrupt_event.is_set():
+                raise RoundInterruptedError("在获取第一帧图像时程序被终止")
 
         first_image = Image.fromarray(first_image_rgb)
         
         # 2. [!!] *第一次* LLM 推理 (阻塞)
         print("[VLA] 正在执行*第一次* LLM 推理 (阻塞)...")
         llm_inference_wrapper(drone, client, instruction, args, first_image, next_batch_data)
+        
+        if program_stop_event.is_set() or round_interrupt_event.is_set():
+                raise RoundInterruptedError("在第一次推理后中断")
+                
         current_batch = next_batch_data.get('batch')
         if current_batch is None:
             # [!!] MODIFIED: Replaced f-string with .format()
             print("[VLA] 第一次 LLM 推理失败: {}".format(next_batch_data.get('error')))
             raise Exception("Initial LLM inference failed")
         
-        while not stop_event.is_set():
+        # [!!] MODIFIED: 主循环添加了中断检查
+        while not (program_stop_event.is_set() or round_interrupt_event.is_set()):
             if current_batch is None or len(current_batch) == 0:
                 print("[VLA] 未收到有效动作，任务终止。")
                 break
@@ -291,15 +245,26 @@ def main_vla_logic(drone, client, instruction, args):
             if len(main_steps) > 0:
                 # [!!] MODIFIED: Replaced f-string with .format()
                 print("[VLA] 正在执行 {} 步主要动作...".format(len(main_steps)))
+                
+                # [!!] --- 唯一的代码修复在此 --- [!!]
+                # 移除了不支持的 'stop_event' 参数
                 drone.move_by_delta_pose_sequence(
                     main_steps, 
                     speed=args.speed
                 )
+                # [!!] --- 修复结束 --- [!!]
             
+            if program_stop_event.is_set() or round_interrupt_event.is_set():
+                raise RoundInterruptedError("在主要步骤执行期间中断")
+
             # 5. [!!] 等待上一个 LLM 线程 (如果存在)
             if llm_thread is not None:
                 print("[VLA] 等待上一个 LLM 线程完成...")
-                llm_thread.join()
+                llm_thread.join() # 这是一个阻塞操作
+                
+                if program_stop_event.is_set() or round_interrupt_event.is_set():
+                    raise RoundInterruptedError("在等待 LLM 线程时中断")
+                
                 current_batch = next_batch_data.get('batch')
                 
                 if next_batch_data.get('done', False):
@@ -334,6 +299,9 @@ def main_vla_logic(drone, client, instruction, args):
                     buffer_steps, 
                     speed=args.speed
                 )
+
+            if program_stop_event.is_set() or round_interrupt_event.is_set():
+                raise RoundInterruptedError("在缓冲区步骤执行期间中断")
             
             step_count += 1
             if args.max_steps is not None and step_count >= args.max_steps:
@@ -342,9 +310,11 @@ def main_vla_logic(drone, client, instruction, args):
                 drone.talk("达到最大步数，任务停止")
                 break
             
-    except (KeyboardInterrupt, InterruptedError):
-        print("\n[VLA] 检测到中断。停止当前VLA任务...")
-        drone.talk("任务已中断")
+    except (KeyboardInterrupt, RoundInterruptedError, InterruptedError) as e:
+        print("\n[VLA] 检测到中断。停止当前VLA任务... ({})".format(type(e).__name__))
+        if not (program_stop_event.is_set() or round_interrupt_event.is_set()):
+             drone.talk("任务已中断")
+        # [!!] 立即发送停止命令
         drone._send_command("fc_vel 0 0 0 0") 
     
     except Exception as e:
@@ -359,8 +329,20 @@ def main_vla_logic(drone, client, instruction, args):
         print("[VLA] VLA 任务结束，正在安全降落...")
         
         try:
-            if drone.get_current_pose()['z'] > 10: 
+            # [!!] 检查是 1. 程序退出 (Ctrl+C / 'q') 还是 2. 轮次中断 ('i')
+            # 这两种情况都应该触发降落
+            if program_stop_event.is_set(): 
+               print("[VLA] 收到程序退出信号，强制降落...")
                drone.land()
+            elif round_interrupt_event.is_set():
+               print("[VLA] 收到轮次中断信号 ('i')，正在降落...")
+               drone.land()
+            # 否则，检查是否是正常结束且高度 > 10
+            elif drone.get_current_pose()['z'] > 10: 
+               print("[VLA] 任务正常完成，高度 > 10，正在降落。")
+               drone.land()
+            else:
+               print("[VLA] 任务正常完成，高度 < 10，无需降落。")
             
         except Exception as e:
             # [!!] MODIFIED: Replaced f-string with .format()
@@ -371,7 +353,37 @@ def main_vla_logic(drone, client, instruction, args):
                 pass
                 
         print("[VLA] VLA 线程已完成。")
-        stop_event.set()
+
+
+# [!!] 新增：用于获取指令的辅助函数
+def get_instruction_from_user():
+    """
+    根据 ENABLE_SPEECH 标志获取用户指令。
+    此函数会阻塞，但可以被 Ctrl+C (SIGINT) 中断。
+    (此函数未更改)
+    """
+    instruction_text = ""
+    if ENABLE_SPEECH:
+        print("\n语音输入已启用。请说话 (或按 Ctrl+C 退出)...")
+        inst = speech.record_and_get_text()
+        inst = instruction.get_inst(inst)
+        instruction_text = inst
+        # [!!] MODIFIED: Replaced f-string with .format()
+        print("识别到的指令: {}".format(instruction_text))
+    else:
+        print("\n语音输入已禁用。")
+        instruction_text = input("请输入VLA指令 (输入 'exit' 或空指令以取消): ")
+    
+    return instruction_text
+
+# [!!] MODIFIED: 'on_round_interrupt' 已被移除 (不再是回调)
+
+def on_program_exit(sig, frame):
+    """Ctrl+C 按下时的回调"""
+    if not program_stop_event.is_set():
+        print("\n[Main] 检测到 Ctrl+C！将退出所有进程...")
+        program_stop_event.set()
+        round_interrupt_event.set() # 同时也中断当前轮
 
 
 if __name__ == "__main__":
@@ -383,6 +395,7 @@ if __name__ == "__main__":
         required=True, 
         help="要使用的VLA模型 ('gr00t' 或 'openvla')"
     )
+    # ... (其余参数保持不变) ...
     parser.add_argument(
         "--ip", 
         type=str, 
@@ -398,7 +411,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--speed", 
         type=int, 
-        default=80,
+        default=40,
         help="无人机执行 VLA 动作的速度 (cm/s)"
     )
     parser.add_argument(
@@ -415,8 +428,6 @@ if __name__ == "__main__":
         default=0, 
         help='额外飞行几个Horizon (默认: 0)'
     )
-    
-    # [!! BARU !!] Argumen baru untuk mengontrol inferensi lokal
     parser.add_argument(
         "--local-gr00t",
         action="store_true",
@@ -425,100 +436,152 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    vla_thread = None
-    keepalive_thread = None
     drone = None
+    client = None
+    vla_thread = None # [!!] 新增: 用于VLA逻辑的线程
+    
+    # [!!] 新增: 保存旧的终端设置
+    old_settings = termios.tcgetattr(sys.stdin)
+
+    # [!!] MODIFIED: 注册 Ctrl+C (SIGINT) 处理器
+    signal.signal(signal.SIGINT, on_program_exit)
 
     try:
-        # 1. 初始化无人机
+        # 1. [!!] 启动热键监听器 (已移除)
+
+        # 2. [!!] 初始化无人机 (只执行一次)
         print("正在初始化 无人机...")
         drone = DjiM4DDrone()
 
-        # 2. [!! DIPERBARUI !!] Inisialisasi klien berdasarkan model DAN mode (lokal/jarak jauh)
+        # 3. [!!] Inisialisasi klien (只执行一次)
         client = None
         total_horizon = args.horizon + args.extra_horizon
 
         if args.model == 'gr00t':
             if args.local_gr00t:
-                # Mode Lokal: Muat model secara langsung
-                # [!!] MODIFIED: Replaced f-string with .format()
                 print("Memuat model GR00T secara LOKAL... (Horizon: {})".format(total_horizon))
                 client = Gr00tLocalClient(horizon=total_horizon)
             else:
-                # Mode Jarak Jauh: Terhubung ke server
                 port = 5555
-                # [!!] MODIFIED: Replaced f-string with .format()
                 print("Menghubungkan ke server GR00T JARAK JAUH: {}:{} (Horizon: {})".format(args.ip, port, total_horizon))
                 client = Gr00tClient(ip=args.ip, port=port, horizon=total_horizon)
         
         elif args.model == 'openvla':
             port = 5007
-            # [!!] MODIFIED: Replaced f-string with .format()
             print("Menghubungkan ke OpenVLA 客户端: {}:{}".format(args.ip, port))
             client = OpenVLAClient(ip=args.ip, port=port)
         
         if client is None:
             raise ValueError("Klien VLA tidak dapat diinisialisasi.")
 
-        # 3. 根据 ENABLE_SPEECH 标志获取指令
-        instruction_text = ""
-        if ENABLE_SPEECH:
-            print("语音输入已启用。请说话...")
-            inst = speech.record_and_get_text()
-            inst = instruction.get_inst(inst)
-            instruction_text = inst
-            # [!!] MODIFIED: Replaced f-string with .format()
-            print("识别到的指令: {}".format(instruction_text))
-        else:
-            print("语音输入已禁用。")
-            instruction_text = input("请输入要执行的VLA指令: ")
-
-        if not instruction_text:
-            raise ValueError("未输入指令，退出程序。")
-
-        # 4. 启动后台线程
-        # vla_thread = threading.Thread(target=main_vla_logic, args=(drone, client, instruction_text, args), daemon=True)
+        # 4. [!!] 开始主事件循环 (多轮次)
         
-        # # if DRONE_TYPE == "tello":
-        # #     keepalive_thread = threading.Thread(target=keep_tello_alive, args=(drone,), daemon=True)
-        # #     print("启动 Keepalive 线程...")
-        # #     keepalive_thread.start()
+        # [!!] MODIFIED: 设置终端为 cbreak 模式 (立即读取单个字符)
+        tty.setcbreak(sys.stdin.fileno())
+        print("\n--- [主事件循环已启动] ---")
+        print("按 'n' 开始新任务 (New Task)")
+        print("按 'i' 中断当前任务 (Interrupt)")
+        print("按 'q' "
+" 退出程序 (Quit)")
+        print("按 'l' 强制降落 (Land)")
+        print("--------------------------")
         
-        # print("启动 VLA 主逻辑线程...")
-        # vla_thread.start()
+        while not program_stop_event.is_set():
+            # 检查 VLA 线程是否已结束
+            if vla_thread and not vla_thread.is_alive():
+                vla_thread.join()
+                vla_thread = None
+                print("\n[Main] VLA 任务线程已结束。")
+                print("按 'n' 开始新任务, 'i' 中断, 'q' 退出, 'l' 降落")
 
-        # # 5. 在主线程中运行视频流
-        # drone_live_feed(drone)
-        main_vla_logic(drone, client, instruction_text, args)
+            # 读取一个字符 (非阻塞)
+            if program_stop_event.wait(0.1): # 0.1秒的超时
+                break # 程序被要求停止
+            
+            # [!!] MODIFIED: 切换到阻塞读取, 这是 cbreak 模式的预期行为
+            # 只有当有按键时, 循环才会继续
+            char = sys.stdin.read(1)
+            
+            if not char or program_stop_event.is_set():
+                continue
 
-    except (KeyboardInterrupt, ValueError) as e:
-        if isinstance(e, ValueError):
-            print(e)
+            # (n) 开始新任务
+            if char == 'n':
+                if vla_thread and vla_thread.is_alive():
+                    print("\n[Main] 错误: 任务已在运行。请先按 'i' 中断。")
+                else:
+                    # [!!] 关键: 运行 input() 前恢复终端
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+                    
+                    instruction_text = ""
+                    try:
+                        instruction_text = get_instruction_from_user()
+                    except (KeyboardInterrupt, EOFError):
+                        program_stop_event.set()
+                    
+                    # [!!] 关键: 恢复 cbreak 模式
+                    tty.setcbreak(sys.stdin.fileno())
+
+                    if instruction_text and instruction_text.lower() != 'exit':
+                        print("[Main] 收到新指令，启动VLA线程...")
+                        round_interrupt_event.clear()
+                        vla_thread = threading.Thread(
+                            target=main_vla_logic,
+                            args=(drone, client, instruction_text, args,
+                                  program_stop_event, round_interrupt_event),
+                            daemon=True
+                        )
+                        vla_thread.start()
+                    else:
+                        print("[Main] 任务已取消。")
+                        print("按 'n' 开始新任务, 'i' 中断, 'q' 退出, 'l' 降落")
+
+            # (i) 中断当前任务
+            elif char == 'i':
+                if vla_thread and vla_thread.is_alive():
+                    print("\n[Main] 检测到 'i'！将中断当前轮次并降落...")
+                    round_interrupt_event.set()
+                else:
+                    print("\n[Main] 没有正在运行的任务可以中断。")
+
+            # (l) 强制降落
+            elif char == 'l':
+                print("\n[Main] 检测到 'l'！强制降落...")
+                drone.land()
+
+            # (q) 退出程序
+            elif char == 'q':
+                print("\n[Main] 检测到 'q'！退出程序...")
+                program_stop_event.set()
+                round_interrupt_event.set() # 确保VLA线程也停止
+                break # 退出 while 循环
+
+    except (KeyboardInterrupt, ValueError, Exception) as e:
+        if isinstance(e, (KeyboardInterrupt)):
+            print("\n[Main] 检测到初始化中断...")
+        elif isinstance(e, (ValueError)):
+             print(e)
         else:
-            print("\n检测到用户中断 (Ctrl+C)，正在关闭程序...")
-    
-    except Exception as e:
-        # [!!] MODIFIED: Replaced f-string with .format()
-        print("程序主线程发生未捕獲异常: {}".format(e))
+            print("[Main] 程序主线程发生未捕獲异常: {}".format(e))
+        
+        program_stop_event.set() # 确保设置了停止标志
         
     finally:
-        print("正在关闭所有线程...")
-        stop_event.set()
+        print("\n[Main] 正在关闭所有线程和连接...")
+        program_stop_event.set() # 确保所有循环都停止
         
-        if keepalive_thread and keepalive_thread.is_alive():
-            keepalive_thread.join()
-            print("Keepalive 线程已加入。")
-            
+        # [!!] 关键: 恢复终端设置，否则您的终端会"坏掉"
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        
         if vla_thread and vla_thread.is_alive():
+            print("[Main] 等待 VLA 线程结束...")
             vla_thread.join()
-            print("VLA 线程已加入。")
             
         if drone:
-            print("主线程安全检查：正在执行最后降落...")
+            print("[Main] 主线程安全检查：正在执行最后降落...")
             try:
                 drone.land()
             except Exception as e:
-                # [!!] MODIFIED: Replaced f-string with .format()
-                print("主线程安全降落失败: {}".format(e))
+                print("[Main] 主线程安全降落失败: {}".format(e))
            
-        print("程序已退出。")
+        print("[Main] 程序已退出。")
