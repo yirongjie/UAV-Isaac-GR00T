@@ -7,14 +7,13 @@ import platform
 import subprocess
 import threading
 import time
+import re  
 from functools import wraps
 
 import cv2
 import dotenv
 import numpy as np
-# from djitellopy import Tello # 移除 Tello 依赖
 from openai import OpenAI
-# from smolagents import tool
 
 # --- M4D 特有的库 ---
 import socket
@@ -112,67 +111,6 @@ def recv_all(sock, count):
 # --- 结束 ---
 
 
-# def expose_methods_as_tools(*, include: list = None, exclude: list = None):
-#     """
-#     (此函数保持不变)
-#     """
-#     def decorator(cls):
-#         class ToolWrapper:
-#             def __init__(self, instance):
-#                 self.instance = instance
-#                 self.tools = []
-#                 methods_to_process = []
-#                 for attr_name in dir(instance):
-#                     attr = getattr(instance, attr_name)
-#                     if callable(attr) and not attr_name.startswith("_"):
-#                         if include and attr_name not in include:
-#                             continue
-#                         if exclude and attr_name in exclude:
-#                             continue
-#                         methods_to_process.append(attr_name)
-#                 for method_name in methods_to_process:
-#                     method = getattr(instance, method_name)
-#                     @wraps(method)
-#                     def tool_func(*args, __method=method, **kwargs):
-#                         return __method(*args, **kwargs)
-#                     tool_func = tool(tool_func) 
-#                     tool_func.__name__ = f"{instance.__class__.__name__}_{method_name}"
-#                     self.tools.append(tool_func)
-#         original_init = cls.__init__
-#         def new_init(self, *args, **kwargs):
-#             original_init(self, *args, **kwargs)
-#             self._tool_wrapper = ToolWrapper(self)
-#         cls.__init__ = new_init
-#         cls.get_tools = lambda self: self._tool_wrapper.tools
-#         return cls
-    
-#     return decorator
-
-# @expose_methods_as_tools(
-#     include=[
-#        # "print_seq",
-#         "move_forward",
-#         "move_backward",
-#         "take_off",
-#         "move_up",
-#         "move_down",
-#         "move_left",
-#         "move_right",
-#         "turn_clockwise",
-#         "turn_counter_clockwise",
-#         "land",
-#         "get_height",
-#         "get_current_pose", # [!!]
-#         "watch",
-#         "objects_vlm",
-#         "scan", # [!!]
-#         "move_to_object",
-#         "take_picture",
-#         "talk",
-#         # "vla",
-#     ],
-#     exclude=["get_frame", "get_frame_vlm", "_send_command", "shutdown", "_get_realtime_pose", "_connect"],
-# )
 class DjiM4DDrone:
     def __init__(self):
         self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
@@ -236,6 +174,105 @@ class DjiM4DDrone:
         else:
             print("[Drone __init__] 未指定 VLA 模型，VLA 功能将不可用。")
         # --- 结束 ---
+
+    
+    # 手动工具生成器
+    # ----------------------------------------------------
+    def _parse_docstring(self, docstring: str) -> dict:
+        """
+        从Numpy风格的文档字符串中解析描述、参数和返回类型。
+        """
+        if not docstring:
+            return {"description": "", "inputs": {}, "output_type": "None"}
+
+        # 1. 解析描述
+        desc_match = re.search(r'^(.*?)(?=\n\s*(Args|Returns|Raises|Examples):|\Z)', docstring, re.DOTALL | re.IGNORECASE)
+        description = desc_match.group(1).strip().replace('\n', ' ') if desc_match else ""
+
+        # 2. 解析参数 (Args)
+        inputs = {}
+        args_match = re.search(r'\n\s*Args:\s*\n(.*?)(?=\n\s*(Returns|Raises|Examples):|\Z)', docstring, re.DOTALL | re.IGNORECASE)
+        if args_match:
+            args_block = args_match.group(1)
+            # 匹配 'param_name (param_type): description'
+            arg_pattern = re.compile(r'^\s*([a-zA-Z0-9_]+)\s*\((.*?)\):\s*(.*?)(?=\n\s*[a-zA-Z0-9_]+\s*\(|\Z)', re.DOTALL | re.MULTILINE)
+            for match in arg_pattern.finditer(args_block):
+                name, type_str, desc = match.groups()
+                inputs[name.strip()] = {
+                    "type": type_str.strip(),
+                    "description": desc.strip().replace('\n', ' ')
+                }
+
+        # 3. 解析返回类型 (Returns)
+        output_type = "None"
+        returns_match = re.search(r'\n\s*Returns:\s*\n\s*(.*?):', docstring, re.DOTALL | re.IGNORECASE)
+        if returns_match:
+            output_type = returns_match.group(1).strip()
+
+        return {"description": description, "inputs": inputs, "output_type": output_type}
+
+    def get_tools(self) -> list:
+        """
+        手动生成工具列表，用于替换 smolagents.tool 装饰器。
+        """
+        # 这是基于你文件中注释掉的 @expose_methods_as_tools 'include' 列表
+        tool_names = [
+            "move_forward",
+            "move_backward",
+            "take_off",
+            "move_up",
+            "move_down",
+            "move_left",
+            "move_right",
+            "turn_clockwise",
+            "turn_counter_clockwise",
+            "land",
+            "get_height",
+            "get_current_pose",
+            "watch",
+            "objects_vlm",
+            "scan",
+            "move_to_object",
+            "take_picture",
+            "talk",
+        ]
+        
+        tools_list = []
+        for name in tool_names:
+            if not hasattr(self, name):
+                print(f"[get_tools] 警告: 未找到名为 '{name}' 的方法。")
+                continue
+                
+            method = getattr(self, name)
+            docstring = inspect.getdoc(method)
+            parsed_doc = self._parse_docstring(docstring)
+            
+            # 构建 smolagents 期望的格式 (也是 YAML 模板期望的格式)
+            tool_def = {
+                "name": name,
+                "description": parsed_doc["description"],
+                "inputs": parsed_doc["inputs"],
+                "output_type": parsed_doc["output_type"],
+                "callable": method # [!!] 保留对实际函数的引用
+            }
+            tools_list.append(tool_def)
+            
+        return tools_list
+
+    def get_tool_by_name(self, name: str) -> callable:
+        """
+        根据名称获取可调用的工具方法。
+        (SimpleToolCallingAgent 将使用此方法)
+        """
+        if not hasattr(self, name):
+            raise ValueError(f"未找到名为 '{name}' 的工具。")
+        
+        method = getattr(self, name)
+        if not callable(method) or name.startswith("_"):
+             raise ValueError(f"'{name}' 不是一个有效的、可调用的工具。")
+             
+        return method
+    # ----------------------------------------------------
 
     def _connect(self) -> bool:
         """
@@ -329,19 +366,12 @@ class DjiM4DDrone:
                         return {"status": "error", "message": f"JSON parse error: {e}"}
 
                 else:
-                    # if response_code == 0:
-                    #     print(f"[_send_command] 错误: 服务器报告命令 '{cmd_name}' 失败。")
-                    #     return {"status": "error", "message": f"Server reported command failed"}
-                    # else:
-                    #     print(f"[_send_command] 命令 '{cmd_name}' 成功。")
-                    #     return {"status": "ok", "type": "simple"}
                     if not is_long_task:
                         # --- 1. 标准短时任务 (fc_takeoff, fc_land, fc_vel) ---
                         if response_code == 0:
                             print(f"[_send_command] 错误: 服务器报告命令 '{cmd_name}' 失败。")
                             return {"status": "error", "message": f"Server reported command failed"}
                         else:
-                            # (假设 1 = 成功，对于短时任务是正确的)
                             print(f"[_send_command] 命令 '{cmd_name}' 成功。")
                             return {"status": "ok", "type": "simple"}
 
@@ -349,12 +379,8 @@ class DjiM4DDrone:
                         # --- 2. 新的长时任务 (fc_pos, fc_pos_wp, etc.) ---
                         if response_code == 1: # 1 = Accepted
                             print(f"[_send_command] 长时任务 '{cmd_name}' 已接受, 正在等待最终完成信号...")
-
-                            # [关键] 设置一个长的超时时间等待任务完成
-                            # (例如 5 分钟 = 300 秒)
                             self.socket.settimeout(300.0) 
 
-                            # [关键] 阻塞并等待第二个响应
                             final_resp_data = recv_all(self.socket, 4)
                             if not final_resp_data:
                                 print(f"[_send_command] 错误: 等待 '{cmd_name}' 完成信号时服务器断开。")
@@ -509,25 +535,10 @@ class DjiM4DDrone:
         self.y -= distance * math.sin(yaw_rad_ccw)
         self._send_command(f"fc_pos -{dist_m} 0 0 0")
 
-    # def _regain_control(self) -> bool:
-    #     """
-    #     [新增] (内部) 在航点任务后重新获取摇杆控制权
-    #     """
-    #     print("[_regain_control] 正在向 C++ Server 请求重新获取摇杆控制权...")
-    #     resp = self._send_command("fc_regain_ctrl")
-    #     if resp.get("status") == "ok":
-    #         print("[_regain_control] 已成功重新获取摇杆控制权。")
-    #         return True
-    #     else:
-    #         print(f"[_regain_control] 警告: 重新获取摇杆控制权失败: {resp.get('message')}")
-    #         return False
-
     def land(self) -> None:
         """
         Land the drone.
         """
-        # self._regain_control() 
-        # time.sleep(0.5) # 等待 C++ 端的 500ms 延迟完成
         self._send_command("fc_land")
         self.x = 0.0
         self.y = 0.0
@@ -1095,9 +1106,6 @@ class DjiM4DDrone:
             
         start_lat = pose_data["lat"]
         start_lon = pose_data["lon"]
-        # (重要) 航线高度是相对起飞点的, 我们使用 get_pose 的 'alt_m'
-        # 如果您希望所有航点都在一个固定的新高度，请取消注释下一行
-        # start_alt = altitude 
         start_alt = pose_data.get("alt_m", altitude) # 使用当前高度或指定高度
         
         print(f"  -> 起始点: Lat={start_lat:.6f}, Lon={start_lon:.6f}, Alt={start_alt:.1f}m")
@@ -1110,13 +1118,11 @@ class DjiM4DDrone:
             new_lat, new_lon = dji_kmz_mission_generator.calculate_new_gps(
                 current_lat, current_lon, north_m, east_m
             )
-            # 保持高度不变
             path_coords.append((new_lon, new_lat, start_alt)) 
             current_lat, current_lon = new_lat, new_lon
             print(f"  -> 航点 {i+1} (N:{north_m}m, E:{east_m}m): Lat={new_lat:.6f}, Lon={new_lon:.6f}")
 
         # 3. 准备 KMZ 文件内容
-        # (这些值是基于 waylines.wpml 的硬编码)
         drone_info = {'enum': 77, 'sub': 0}
         payload_info = {'enum': 66, 'sub': 0, 'pos': 0}
         
@@ -1195,7 +1201,6 @@ class DjiM4DDrone:
             print(f"  -> 航点 {i+1}: Lat={lat:.6f}, Lon={lon:.6f}, Alt={alt:.1f}m")
 
         # 3. 准备 KMZ 文件内容
-        # (这些值是基于 waylines.wpml 的硬编码)
         drone_info = {'enum': 77, 'sub': 0}
         payload_info = {'enum': 66, 'sub': 0, 'pos': 0}
         
