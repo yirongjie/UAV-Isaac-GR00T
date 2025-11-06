@@ -198,57 +198,39 @@ class Qwen3Attention(nn.Module):
 
     def __init__(self, config: Qwen3Config, layer_idx: Optional[int] = None):
         super().__init__()
+        self.layer_type = config.layer_types[layer_idx] if hasattr(config, "layer_types") else None
         self.config = config
         self.layer_idx = layer_idx
-        if layer_idx is None:
-            logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
-                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
-                "when creating this class."
-            )
-
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
-        self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
+        self.is_causal = True
 
-        
-        # 确保 q_norm 和 k_norm 被正确创建
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
-            )
         self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
         self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias,
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
         )
         self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # unlike olmo, only on the head dim!
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # thus post q_norm does not need reshape
+        self.sliding_window = config.sliding_window if self.layer_type == "sliding_attention" else None
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.num_heads = config.num_attention_heads
         self.rotary_emb = Qwen3RotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+
 
     def forward(
         self,
@@ -272,20 +254,6 @@ class Qwen3Attention(nn.Module):
         key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-
-        # query_states = self.q_proj(hidden_states)
-        # key_states = self.k_proj(hidden_states)
-        # value_states = self.v_proj(hidden_states)
-
-        # query_states = query_states.view(
-        #     bsz, q_len, self.num_heads, self.head_dim
-        # ).transpose(1, 2)
-        # key_states = key_states.view(
-        #     bsz, q_len, self.num_key_value_heads, self.head_dim
-        # ).transpose(1, 2)
-        # value_states = value_states.view(
-        #     bsz, q_len, self.num_key_value_heads, self.head_dim
-        # ).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -344,7 +312,8 @@ class Qwen3Attention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        # attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
 
         attn_output = self.o_proj(attn_output)
 

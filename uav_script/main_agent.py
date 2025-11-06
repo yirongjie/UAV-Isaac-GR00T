@@ -12,6 +12,17 @@ import json
 import inspect
 from openai import OpenAI
 
+# --- 本地模型导入 ---
+import torch
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+except ImportError:
+    print("警告: 'transformers' 库未安装。本地 LLM 模式将不可用。")
+    print("请运行: pip install transformers torch")
+    AutoModelForCausalLM, AutoTokenizer = None, None
+# --- [新增结束] ---
+
+
 # USE_VLM_AGENT = False
 # --- 动态导入无人机 Wrapper ---
 TelloDrone, MockDrone, AirSimDrone, FanciSwarmDrone, DjiM4DDrone, MockDjiM4DDrone = None, None, None, None, None, None
@@ -19,7 +30,7 @@ TelloDrone, MockDrone, AirSimDrone, FanciSwarmDrone, DjiM4DDrone, MockDjiM4DDron
 dotenv.load_dotenv()
 
 # --- 全局配置 ---
-API_KEY = os.environ["OPENROUTER_API_KEY"]
+API_KEY = os.environ.get("OPENROUTER_API_KEY") # API 模式下仍然需要
 MODEL_NAME = os.environ.get("MODEL_NAME", "qwen/qwen3-vl-235b-a22b-instruct")
 TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.0))
 AGENT_MODE = os.environ.get("AGENT_MODE", "tool")
@@ -27,6 +38,11 @@ USE_CUSTOM_PROMPT = True
 PROMPT_PATH = os.environ.get("PROMPT_PATH", "toolcalling_agent_cn.yaml")
 
 DRONE_TYPE = os.environ.get("DRONE_TYPE", "djim4d").lower()  
+
+# --- [修改] LLM 路径配置 ---
+# 如果设置了此路径，将优先使用本地模型。否则使用 API。
+LOCAL_MODEL_PATH = os.environ.get("LOCAL_MODEL_PATH", "") # 默认值为空字符串
+# --- [修改结束] ---
 
 # ----------------------------------------------------
 
@@ -37,10 +53,14 @@ class SimpleLiteLLMModel:
     def __init__(self, model_id, api_key, base_url, temperature):
         self.model_id = model_id
         self.temperature = temperature
+        if not api_key:
+             print("警告: [SimpleLiteLLMModel] 未提供 API_KEY。")
+             raise ValueError("API 模式需要 OPENROUTER_API_KEY。")
+             
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=30.0  # [!! 新增 !!] 增加30秒超时
+            timeout=30.0
         )
 
     def chat(self, messages: list) -> str:
@@ -59,13 +79,90 @@ class SimpleLiteLLMModel:
             print(f"[SimpleLiteLLMModel] 调用 LLM 出错: {e}")
             return f"错误: 调用模型失败 - {e}"
 
+# --- 本地 Transformers 模型封装器 ---
+class TransformersLocalModel:
+    """
+    一个封装器，用于本地加载 Transformers 模型，使其兼容 Agent。
+    """
+    def __init__(self, model_path: str):
+        if AutoModelForCausalLM is None:
+            raise ImportError("Transformers 库未成功导入。无法使用本地模式。")
+            
+        print(f"[TransformersLocalModel] 正在从 {model_path} 加载模型和 Tokenizer...")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[TransformersLocalModel] 使用设备: {self.device}")
+        
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path,
+                                                            use_fast=False,
+                                                            trust_remote_code=True)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                torch_dtype="auto",
+                device_map=self.device
+                )
+            self.model.eval() # 设置为评估模式
+            print("[TransformersLocalModel] 模型加载完成。")
+        except Exception as e:
+            print(f"[TransformersLocalModel] 加载本地模型失败: {e}")
+            print(f"请确保路径 '{model_path}' 是一个有效的 Hugging Face 模型目录。")
+            raise
+
+    def chat(self, messages: list) -> str:
+        """
+        调用本地 LLM 生成响应
+        """
+        try:
+            # 1. 应用聊天模板 (将 OpenAI 格式转换为模型需要的格式)
+            #    add_generation_prompt=True 会在末尾添加助手角色的起始标记
+            prompt_str = self.tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            
+            # 2. Tokenize
+            inputs = self.tokenizer(prompt_str, return_tensors="pt").to(self.device)
+            
+            # 3. Generate
+            #    我们需要记录输入 token 的长度，以便只解码新生成的部分
+            input_token_len = inputs.input_ids.shape[1]
+            
+            with torch.no_grad(): # 推理时不需要梯度
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=1536, # 允许 Agent 输出较长的思考过程
+                    pad_token_id=self.tokenizer.eos_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    temperature=TEMPERATURE if TEMPERATURE > 0 else 1.0, # 0.0 可能导致卡住，设为 1.0
+                    top_p=0.9,
+                    do_sample=True if TEMPERATURE > 0 else False,
+                )
+            
+            # 4. Decode
+            #    只解码新生成的部分 (outputs[0] 是 [batch_size=0])
+            new_tokens = outputs[0][input_token_len:]
+            response_content = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            
+            return response_content.strip()
+
+        except Exception as e:
+            print(f"[TransformersLocalModel] 调用本地 LLM 出错: {e}")
+            import traceback
+            traceback.print_exc() # 打印详细堆栈
+            return f"错误: 调用本地模型失败 - {e}"
+# --- [新增结束] ---
+
+
 class SimpleToolCallingAgent:
     """
     一个精简的工具调用代理，用于替换 smolagents.ToolCallingAgent
     """
-    def __init__(self, tools: list, drone_instance, model: SimpleLiteLLMModel, system_prompt_template: str, max_steps: int = 100):
+    def __init__(self, tools: list, drone_instance, model, system_prompt_template: str, max_steps: int = 100):
+        # model 现在可以是 SimpleLiteLLMModel 或 TransformersLocalModel
         self.drone_instance = drone_instance
-        self.model = model
+        self.model = model 
         self.max_steps = max_steps
 
         self.tools_list = tools 
@@ -385,13 +482,45 @@ def agent_main():
 
         tools = drone.get_tools()
 
-        #  初始化我们自己的模型和代理
-        model = SimpleLiteLLMModel(
-            model_id=MODEL_NAME,
-            api_key=API_KEY,
-            base_url=os.environ.get("BASE_URL", "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)"),
-            temperature=TEMPERATURE,
-        )
+        # --- 根据 LOCAL_MODEL_PATH 初始化模型 ---
+        model = None
+        # 检查 LOCAL_MODEL_PATH 是否已设置且是一个存在的目录
+        if LOCAL_MODEL_PATH and os.path.isdir(LOCAL_MODEL_PATH):
+            print(f"--- 检测到本地模型路径，使用本地 LLM 模式 ---")
+            print(f"模型路径: {LOCAL_MODEL_PATH}")
+            try:
+                model = TransformersLocalModel(model_path=LOCAL_MODEL_PATH)
+            except Exception as e:
+                print(f"!! 严重错误: 加载本地模型失败: {e}")
+                print("!! 将回退到 API 模式 (如果 API_KEY 可用)...")
+                model = None # 确保 model 为 None，以便进入 API 逻辑
+        
+        elif LOCAL_MODEL_PATH:
+            # 如果路径被设置了，但不是一个有效的目录
+            print(f"警告: LOCAL_MODEL_PATH ('{LOCAL_MODEL_PATH}') 已设置，但不是一个有效的目录。")
+            print("将回退到 API 模式 (如果 API_KEY 可用)...")
+
+        # 如果模型未成功加载 (无论是未设置路径还是加载失败)
+        if model is None:
+            print(f"--- 使用 API (OpenRouter) LLM 模式 ---")
+            if not API_KEY:
+                print("错误: 未设置 LOCAL_MODEL_PATH，也未在 .env 中找到 OPENROUTER_API_KEY。")
+                print("请设置其中一个来运行 Agent。")
+                return # 无法继续
+
+            base_url = os.environ.get("BASE_URL", "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)")
+            # 修复之前代码中可能存在的 Markdown 链接错误
+            if "]" in base_url or "[" in base_url:
+                 base_url = "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)"
+                 
+            model = SimpleLiteLLMModel(
+                model_id=MODEL_NAME,
+                api_key=API_KEY,
+                base_url=base_url,
+                temperature=TEMPERATURE,
+            )
+        # --- 初始化模型结束 ---
+
 
         agent = AGENT_CLS(
             tools=tools,
