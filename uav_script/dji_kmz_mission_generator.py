@@ -6,7 +6,7 @@ from datetime import datetime
 
 # --- 配置 ---
 # C++ Server 和此 Python 脚本都必须能访问这个路径
-KMZ_SAVE_PATH = "/home/dji/LMFly/Isaac-GR00T/uav_script/dynamic_mission.kmz" 
+KMZ_SAVE_PATH = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/dynamic_mission.kmz" 
 EARTH_RADIUS_M = 6371000.0
 
 # --- KML/WPML 生成器 (基于您上传的 waylines.wpml) ---

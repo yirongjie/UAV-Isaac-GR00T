@@ -321,7 +321,7 @@ class Gr00tLocalClient(PolicyClient):
     """Klien ini memuat dan menjalankan model GR00T secara *lokal* dalam proses yang sama."""
     def __init__(self, horizon=4):
         if not GR00T_INSTALLED:
-            raise ImportError("Pustaka 'gr00t' tidak diinstal. Tidak dapat menggunakan Gr00tLocalClient.")
+            raise ImportError("package 'gr00t' tidak diinstal. Tidak dapat menggunakan Gr00tLocalClient.")
             
         super().__init__("localhost", 0) # IP/Port tidak relevan di sini
         self.horizon = horizon

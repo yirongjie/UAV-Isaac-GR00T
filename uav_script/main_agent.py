@@ -60,7 +60,7 @@ class SimpleLiteLLMModel:
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=30.0
+            timeout=300.0
         )
 
     def chat(self, messages: list) -> str:
@@ -513,9 +513,27 @@ def agent_main():
             if "]" in base_url or "[" in base_url:
                  base_url = "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)"
                  
+            # 2. 检查是否为本地 llama-server
+            # (环境变量 BASE_URL="http://0.0.0.0:XXXX/v1" 匹配这个)
+            is_local_server = "0.0.0.0" in base_url or "localhost" in base_url
+
+            effective_api_key = API_KEY # API_KEY 是从文件顶部加载的
+            model_id=MODEL_NAME
+            if is_local_server:
+                print(f"--- 检测到本地 llama-server 模式 (Base URL: {base_url}) ---")
+                effective_api_key = "sk-fake-key"
+                model_id="gpt-3.5-turbo"
+
+            else:
+                print(f"--- 使用 API (OpenRouter) LLM 模式 ---")
+                if not effective_api_key: # 只有在不是本地服务器时，才检查 API_KEY
+                    print("错误: 未设置 LOCAL_MODEL_PATH，也未在 .env 中找到 OPENROUTER_API_KEY。")
+                    print("请设置其中一个来运行 Agent。")
+                    return # 无法继续
+        
             model = SimpleLiteLLMModel(
-                model_id=MODEL_NAME,
-                api_key=API_KEY,
+                model_id=model_id,
+                api_key=effective_api_key,
                 base_url=base_url,
                 temperature=TEMPERATURE,
             )

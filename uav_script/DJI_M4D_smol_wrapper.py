@@ -20,6 +20,7 @@ import socket
 import struct
 import dji_kmz_mission_generator
 # --- 结束 ---
+from lvface_inferencer import LVFaceONNXInferencer
 
 dotenv.load_dotenv()
 try:
@@ -308,7 +309,7 @@ class DjiM4DDrone:
         cmd_name = cmd_parts[0]
         cmd_args = " ".join(cmd_parts[1:])
 
-        print(f"[_send_command] Sending: '{cmd_name}' with args: '{cmd_args}'")
+        # print(f"[_send_command] Sending: '{cmd_name}' with args: '{cmd_args}'")
         
         with self.command_lock:
             LONG_RUNNING_CMDS = ["fc_pos", "fc_pos_gnd", "fc_seq", "fc_pos_gps", "fc_pos_wp"]
@@ -508,6 +509,39 @@ class DjiM4DDrone:
         relative_yaw_cw_deg = (current_abs_yaw_cw_deg - origin_yaw_cw_deg) % 360
         relative_yaw_ccw_deg = (360 - relative_yaw_cw_deg) % 360 
         return relative_yaw_ccw_deg
+    
+    # def recalibrate_local_state(self):
+    #     """
+    #     重置本地航位推算状态 (x, y) 并重新设置原点 (GPS/Yaw)，
+    #     假设无人机已在空中悬停。此过程不发送任何起飞/降落指令。
+    #     """
+    #     # [修改] 1. 调用新的 C++ 命令，执行 Release/Obtain/Hover 周期以强制解锁
+    #     print("[校准] 正在执行 C++ 端 Release/Obtain 周期以强制解锁飞控...")
+    #     resp = self._send_command("fc_regain_ctrl") 
+        
+    #     if resp.get("status") != "ok":
+    #          # 如果解锁命令失败，后续 VLA 任务很可能会失败。
+    #          print("[校准] 严重错误: C++ 端 'fc_regain_ctrl' 命令失败。请手动摇杆解锁。")
+    #     else:
+    #          print("[校准] C++ 端控制权重新获取成功。")
+
+    #     # 2. 重置本地航位推算坐标
+    #     self.x = 0.0
+    #     self.y = 0.0
+        
+    #     # 3. 重新获取并设置原点姿态 (关键步骤)
+    #     time.sleep(1) # 等待 PSDK 状态稳定
+    #     pose = self._get_realtime_pose()
+    #     print("[校准] 状态校准成功。")
+    #     if pose.get("lat") != 0.0 or pose.get("lon") != 0.0:
+    #         self.origin_lat = pose["lat"]
+    #         self.origin_lon = pose["lon"]
+    #         self.origin_alt_m = pose["alt_m"]
+    #         self.origin_yaw_deg = pose["yaw_deg"] 
+    #         print(f"[校准] 新原点已设置: Lat={self.origin_lat}, Lon={self.origin_lon}, Alt={self.origin_alt_m}m, Yaw={self.origin_yaw_deg}deg (CW North)")
+    #     else:
+    #         print("[校准] 警告: 状态校准后未能获取原点 GPS/Yaw。")
+    #         self.origin_yaw_deg = 0.0
 
     def move_forward(self, distance: int) -> None:
         """
@@ -960,6 +994,7 @@ class DjiM4DDrone:
         if n_steps == 0:
             return
         cmd_parts = [f"fc_seq {float(speed)} {n_steps}"]
+        print("=="*10)
         for i, (dx_cm, dy_cm_vla, dz_cm_vla, dyaw_deg) in enumerate(delta_pose_array):
             cmd_parts.append(f"{dx_cm} {dy_cm_vla} {dz_cm_vla} {dyaw_deg}")
             try:
@@ -970,8 +1005,9 @@ class DjiM4DDrone:
                 self.y += body_x * s + body_y * c
             except Exception as e:
                 print(f"[move_by_delta_pose_sequence] 航位推算更新失败: {e}")
-            if i == 0: 
-                 print(f"第{i + 1}步 (-> C++ fc_seq): dx={dx_cm:.1f}cm, dy={dy_cm_vla:.1f}cm(R), dz={dz_cm_vla:.1f}cm(D), dyaw={dyaw_deg:.1f}度(CW)")
+            # if i == 0: 
+            print(f"【第{i + 1}步】 (-> C++ fc_seq): dx={dx_cm:.1f}cm, dy={dy_cm_vla:.1f}cm(R), dz={dz_cm_vla:.1f}cm(D), dyaw={dyaw_deg:.1f}度(CW)")
+        print("=="*10)
         full_cmd_str = " ".join(cmd_parts)
         
         resp = self._send_command(full_cmd_str) 
@@ -1232,6 +1268,99 @@ class DjiM4DDrone:
         else:
             print(f"[fly_dynamic_kmz_mission_gps] 错误: C++ Server 报告执行失败: {resp.get('message')}")
             return False
+        
+    def face_compare(self) -> bool:
+        """
+        人脸比较。立刻 get_frame 获得一张图片和 /home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg 这张人图片对比相似度，
+        大于50% (即 similarity > 0.5) 就判定是一个人，返回 True。
+
+        Returns:
+            bool: 如果是同一个人 (相似度 > 50%) 返回 True, 否则返回 False。
+        """
+        if LVFaceONNXInferencer is None:
+            print("[face_compare] 错误: 'lvface_inferencer' 库未成功导入。")
+            self.talk("人脸识别库未安装，无法比较")
+            return False
+
+        reference_image_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg"
+        temp_current_frame_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_drone_face.jpg"
+        model_file = "/open_app/models/LVFace/LVFace-B_Glint360K.onnx" 
+
+        # 1. 初始化推理器
+        try:
+            inferencer = LVFaceONNXInferencer(
+                model_path=model_file,  # Path to your ONNX model
+                use_gpu=True            # 假设环境支持 GPU
+            )
+        except Exception as e:
+            print(f"[face_compare] 错误: 初始化 LVFaceONNXInferencer 失败: {e}")
+            self.talk("人脸识别模块初始化失败")
+            return False
+
+        # 2. 获取无人机当前帧并保存
+        print("[face_compare] 正在从无人机获取当前帧 (使用 get_frame)...")
+        # get_frame() 返回 480x360 RGB numpy 数组
+        current_frame_rgb = self.get_frame_vlm() 
+        
+        if current_frame_rgb is None:
+            print("[face_compare] 错误: 从 get_frame() 未能获取图像。")
+            self.talk("获取当前图像失败")
+            return False
+
+        # 将 RGB 帧转换为 BGR (LVFace 可能期望 BGR，但更重要的是保存)
+        # current_frame_bgr = cv2.cvtColor(current_frame_rgb, cv2.COLOR_RGB2BGR)
+        try:
+            cv2.imwrite(temp_current_frame_path, current_frame_rgb)
+        except Exception as e:
+            print(f"[face_compare] 错误: 保存当前帧到临时文件失败: {e}")
+            self.talk("保存临时图像失败")
+            return False
+            
+        # 3. 提取特征
+        try:
+            # 提取参考图片特征
+            if not os.path.exists(reference_image_path):
+                print(f"[face_compare] 错误: 参考图片未找到: {reference_image_path}")
+                self.talk("未找到参考照片")
+                return False
+                
+            print("[face_compare] 正在提取参考图片特征...")
+            feat_ref = inferencer.infer_from_image(reference_image_path)
+            if feat_ref is None:
+                 print("[face_compare] 错误: 无法从参考图片中提取人脸特征。")
+                 self.talk("无法从参考照片中提取人脸")
+                 return False
+
+            # 提取当前帧特征
+            print("[face_compare] 正在提取当前帧特征...")
+            feat_current = inferencer.infer_from_image(temp_current_frame_path)
+            if feat_current is None:
+                 print("[face_compare] 警告: 无法从当前帧中提取人脸特征。")
+                 self.talk("当前画面中未发现人脸")
+                 return False
+
+            # 4. 计算相似度
+            similarity = inferencer.calculate_similarity(feat_ref, feat_current)
+            
+            print(f"[face_compare] 相似度分数: {similarity:.6f}")
+
+            # 5. 判断
+            similarity_threshold = 0.3
+            if similarity > similarity_threshold:
+                self.talk(f"匹配成功，相似度 {similarity:.2f} 大于百分之五十")
+                return True
+            else:
+                self.talk(f"未找到匹配的人，相似度 {similarity:.2f} 不足百分之五十")
+                return False
+
+        except Exception as e:
+            print(f"[face_compare] 人脸识别过程中发生错误: {e}")
+            self.talk("人脸识别过程中发生错误")
+            return False
+        # finally:
+             # 清理临时文件
+            # if os.path.exists(temp_current_frame_path):
+            #     os.remove(temp_current_frame_path)
        
     def shutdown(self):
         """

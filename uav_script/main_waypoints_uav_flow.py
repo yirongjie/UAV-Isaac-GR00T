@@ -46,7 +46,7 @@ except ImportError:
 # --- 线程协调事件 ---
 program_stop_event = threading.Event() # 用于 Ctrl+C 或 'q' 退出整个程序
 round_interrupt_event = threading.Event() # 用于 'i' 中断当前轮次
-
+vla_task_completed_flag = threading.Event() # 用于指示 VLA 任务已完成，需要新的指令
 
 # ==============================================================================
 # 
@@ -96,6 +96,30 @@ def convert_openvla_poses_to_deltas(poses_frd_ccw_rad):
         
     return np.array(deltas_frd_cw_deg)
 
+def _is_action_batch_small(batch: np.ndarray, threshold: float = 1.0) -> bool:
+    """
+    检查整个动作批次中的所有增量是否都在 [-threshold, threshold] cm/deg 之间。
+    
+    Args:
+        batch (np.ndarray): N x 4 的动作增量数组 (cm, deg)。
+        threshold (float): 允许的最大绝对值 (厘米/度)。
+        
+    Returns:
+        bool: 如果所有值都小于或等于阈值，则返回 True。
+    """
+    if batch.size == 0:
+        return True # 空批次视为小动作
+        
+    # 检查批次中所有元素的绝对值是否都小于等于阈值
+    # np.max(np.abs(batch)) 返回批次中绝对值最大的那个元素
+    max_delta = np.max(np.abs(batch))
+    
+    if max_delta <= threshold:
+        print(f"[VLA] 动作批次判断: 最大增量 {max_delta:.2f}cm/deg <= 阈值 {threshold:.1f}cm/deg。判定为小动作。")
+        return True
+    else:
+        # print(f"[VLA] 动作批次判断: 最大增量 {max_delta:.2f}cm/deg > 阈值 {threshold:.1f}cm/deg。判定为大动作。")
+        return False
 
 def llm_inference_wrapper(drone, client, instruction, args, 
                           first_image, 
@@ -223,6 +247,14 @@ def main_vla_logic(drone, client, instruction, args, program_stop_event, round_i
             if current_batch is None or len(current_batch) == 0:
                 print("[VLA] 未收到有效动作，任务终止。")
                 break
+
+            # 检查当前批次是否是小增量，如果 max(|dx|, |dy|, |dz|, |dyaw|) < 1.0 cm/deg，则自动停止
+            if _is_action_batch_small(current_batch, threshold=1.0):
+                print("[VLA] **动作增量过小，判定任务完成，自动终止。**")
+                drone.talk("动作增量过小，VLA任务自动完成")
+                vla_task_completed_flag.set()
+                break 
+            # --- ---
 
             # 3. 拆分批次
             if args.extra_horizon == 0:
@@ -396,18 +428,18 @@ def run_waypoint_mission(drone):
 
         # --- 规划 3 个绝对航点 ---
         lat_1, lon_1 = calculate_new_gps(base_lat, base_lon, 20.0, 20.0)
-        lat_2, lon_2 = calculate_new_gps(lat_1, lon_1, -10.0, 30.0)
-        lat_3, lon_3 = calculate_new_gps(lat_2, lon_2, 10.0, -10.0)
+        # lat_2, lon_2 = calculate_new_gps(lat_1, lon_1, -10.0, 30.0)
+        # lat_3, lon_3 = calculate_new_gps(lat_2, lon_2, 10.0, -10.0)
 
         mission_points_lla = [
             [lat_1, lon_1, base_alt], # [纬度, 经度, 高度]
-            [lat_2, lon_2, base_alt],
-            [lat_3, lon_3, base_alt]
+            # [lat_2, lon_2, base_alt],
+            # [lat_3, lon_3, base_alt]
         ]
         
         print(f"  -> 航点 1 (NE): Lat={lat_1:.6f}, Lon={lon_1:.6f}")
-        print(f"  -> 航点 2 (SE): Lat={lat_2:.6f}, Lon={lon_2:.6f}")
-        print(f"  -> 航点 3 (W) : Lat={lat_3:.6f}, Lon={lon_3:.6f}")
+        # print(f"  -> 航点 2 (SE): Lat={lat_2:.6f}, Lon={lon_2:.6f}")
+        # print(f"  -> 航点 3 (W) : Lat={lat_3:.6f}, Lon={lon_3:.6f}")
 
         # 4. 执行动态 KMZ 航线
         print("\n[航点] [步骤 3/4] 正在发送 'fly_dynamic_kmz_mission_gps' 指令...")
@@ -521,6 +553,25 @@ if __name__ == "__main__":
     # 注册 Ctrl+C (SIGINT) 处理器
     signal.signal(signal.SIGINT, on_program_exit)
 
+    client = None
+    total_horizon = args.horizon + args.extra_horizon
+    if args.model == 'gr00t':
+        if args.local_gr00t:
+            print("Memuat model GR00T secara LOKAL... (Horizon: {})".format(total_horizon))
+            client = Gr00tLocalClient(horizon=total_horizon)
+        else:
+            port = 5555
+            print("Menghubungkan ke server GR00T JARAK JAUH: {}:{} (Horizon: {})".format(args.ip, port, total_horizon))
+            client = Gr00tClient(ip=args.ip, port=port, horizon=total_horizon)
+    elif args.model == 'openvla':
+        port = 5007
+        print("Menghubungkan ke OpenVLA 客户端: {}:{}".format(args.ip, port))
+        client = OpenVLAClient(ip=args.ip, port=port)
+    
+    if client is None:
+        raise ValueError("Klien VLA tidak dapat diinisialisasi.")
+        
+
     try:
         # 1. [!!] 初始化无人机 (只执行一次)
         print("正在初始化 无人机 (DjiM4DDrone)...")
@@ -531,33 +582,25 @@ if __name__ == "__main__":
         #     此函数将处理起飞、飞行航点，并在最后悬停
         run_waypoint_mission(drone)
 
+
+        # [!!] MODIFIED: Replaced f-string with .format() (in commented line)
+        # drone.land()
+        # time.sleep(10) # 等待稳定
+        # print("[VLA] 正在起飞...")
+        # drone.take_off()
+        # time.sleep(5) # 等待稳定
+
+        # drone.recalibrate_local_state()
+
         # 3. [!!] 阶段 2: 初始化 VLA 客户端
         print("\n--- [阶段 2: VLA 交互式控制] ---")
-        client = None
-        total_horizon = args.horizon + args.extra_horizon
 
-        if args.model == 'gr00t':
-            if args.local_gr00t:
-                print("Memuat model GR00T secara LOKAL... (Horizon: {})".format(total_horizon))
-                client = Gr00tLocalClient(horizon=total_horizon)
-            else:
-                port = 5555
-                print("Menghubungkan ke server GR00T JARAK JAUH: {}:{} (Horizon: {})".format(args.ip, port, total_horizon))
-                client = Gr00tClient(ip=args.ip, port=port, horizon=total_horizon)
-        
-        elif args.model == 'openvla':
-            port = 5007
-            print("Menghubungkan ke OpenVLA 客户端: {}:{}".format(args.ip, port))
-            client = OpenVLAClient(ip=args.ip, port=port)
-        
-        if client is None:
-            raise ValueError("Klien VLA tidak dapat diinisialisasi.")
-        
         # 4. [!!] 阶段 2: 开始 VLA 主事件循环 (多轮次)
         
         # 设置终端为 cbreak 模式
         tty.setcbreak(sys.stdin.fileno())
         print("\n--- [VLA 事件循环已启动] ---")
+        print("飞机需要手柄解锁一下。")
         print("飞机已在空中，准备接收VLA指令。")
         print("按 'n' 开始新任务 (New Task)")
         print("按 'i' 中断当前任务 (Interrupt)")
@@ -572,12 +615,26 @@ if __name__ == "__main__":
                 vla_thread = None
                 print("\n[Main] VLA 任务线程已结束。")
                 print("按 'n' 开始新任务, 'i' 中断, 'q' 退出, 'l' 降落")
+            
+            # [!!] 新增: 检查任务完成标志并自动触发 'n' 逻辑 [!!]
+            char = None
+            if vla_task_completed_flag.is_set():
+                char = 'n' # 模拟按下了 'n'
+                vla_task_completed_flag.clear() # 清除标志，准备接收下一个任务完成信号
+            
+            # [!!] 修改: 如果没有自动触发，则等待键盘输入 [!!]
+            if char is None:
+                if program_stop_event.wait(0.1): # 0.1秒的超时
+                    break # 程序被要求停止
+                
+                # 使用非阻塞读取，如果读取不到则 char 保持为 None
+                try:
+                    # 注意：sys.stdin.read(1) 在 cbreak 模式下是阻塞的，
+                    # 但在循环中，我们可以先等待 program_stop_event.wait(0.1) 避免卡死
+                    char = sys.stdin.read(1)
+                except:
+                    char = None # 忽略读取错误
 
-            if program_stop_event.wait(0.1): # 0.1秒的超时
-                break # 程序被要求停止
-            
-            char = sys.stdin.read(1)
-            
             if not char or program_stop_event.is_set():
                 continue
 

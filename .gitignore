@@ -1,5 +1,6 @@
 __pycache__
 uav_script/*.png
+uav_script/*.jpg
 uav_script/.env
 uav_script/logs_vla
 uav_script/dynamic_mission.kmz

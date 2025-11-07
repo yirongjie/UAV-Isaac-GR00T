@@ -94,6 +94,32 @@ def convert_openvla_poses_to_deltas(poses_frd_ccw_rad):
         
     return np.array(deltas_frd_cw_deg)
 
+# (在 main_uav_flow.py 文件中，例如在 convert_openvla_poses_to_deltas 函数之后)
+
+def _is_action_batch_small(batch: np.ndarray, threshold: float = 1.0) -> bool:
+    """
+    检查整个动作批次中的所有增量是否都在 [-threshold, threshold] cm/deg 之间。
+    
+    Args:
+        batch (np.ndarray): N x 4 的动作增量数组 (cm, deg)。
+        threshold (float): 允许的最大绝对值 (厘米/度)。
+        
+    Returns:
+        bool: 如果所有值都小于或等于阈值，则返回 True。
+    """
+    if batch.size == 0:
+        return True # 空批次视为小动作
+        
+    # 检查批次中所有元素的绝对值是否都小于等于阈值
+    # np.max(np.abs(batch)) 返回批次中绝对值最大的那个元素
+    max_delta = np.max(np.abs(batch))
+    
+    if max_delta <= threshold:
+        print(f"[VLA] 动作批次判断: 最大增量 {max_delta:.2f}cm/deg <= 阈值 {threshold:.1f}cm/deg。判定为小动作。")
+        return True
+    else:
+        # print(f"[VLA] 动作批次判断: 最大增量 {max_delta:.2f}cm/deg > 阈值 {threshold:.1f}cm/deg。判定为大动作。")
+        return False
 
 # [!!] MODIFICADO: Anotações de tipo removidas
 def llm_inference_wrapper(drone, client, instruction, args, 
@@ -229,6 +255,13 @@ def main_vla_logic(drone, client, instruction, args, program_stop_event, round_i
             if current_batch is None or len(current_batch) == 0:
                 print("[VLA] 未收到有效动作，任务终止。")
                 break
+
+            # 检查当前批次是否是小增量，如果 max(|dx|, |dy|, |dz|, |dyaw|) < 1.0 cm/deg，则自动停止
+            if _is_action_batch_small(current_batch, threshold=1.0):
+                print("[VLA] **动作增量过小，判定任务完成，自动终止。**")
+                drone.talk("动作增量过小，VLA任务自动完成")
+                break 
+            # --- ---
 
             # 3. [!!] 拆分批次
             if args.extra_horizon == 0:
