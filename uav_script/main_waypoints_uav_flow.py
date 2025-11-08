@@ -123,7 +123,8 @@ def _is_action_batch_small(batch: np.ndarray, threshold: float = 1.0) -> bool:
 
 def llm_inference_wrapper(drone, client, instruction, args, 
                           first_image, 
-                          out_data):
+                          out_data,
+                          base_proprio):
     """
     在一个单独的线程中运行 VLA 推理。
     (此函数未更改)
@@ -137,7 +138,10 @@ def llm_inference_wrapper(drone, client, instruction, args,
             return
             
         current_image = Image.fromarray(current_image_rgb)
-        proprio = get_vla_proprio(drone)
+        # 获取当前全局姿态
+        current_proprio_global = get_vla_proprio(drone) 
+        # 计算相对于任务起点的相对姿态
+        proprio = current_proprio_global - base_proprio 
         
         # 2. 从 VLA 模型获取动作
         obs = {
@@ -213,6 +217,9 @@ def main_vla_logic(drone, client, instruction, args, program_stop_event, round_i
             print("[VLA] 无人机已起飞。")
         else:
             print("[VLA] 无人机已在空中，跳过起飞步骤。")
+
+        base_proprio = get_vla_proprio(drone)
+        print("[VLA] 任务基准姿态 (base_proprio): {}".format(base_proprio))
         
         
         # --- VLA 持续控制循环 ---
@@ -233,7 +240,7 @@ def main_vla_logic(drone, client, instruction, args, program_stop_event, round_i
         
         # 2. *第一次* LLM 推理 (阻塞)
         print("[VLA] 正在执行*第一次* LLM 推理 (阻塞)...")
-        llm_inference_wrapper(drone, client, instruction, args, first_image, next_batch_data)
+        llm_inference_wrapper(drone, client, instruction, args, first_image, next_batch_data, base_proprio)
         
         if program_stop_event.is_set() or round_interrupt_event.is_set():
                 raise RoundInterruptedError("在第一次推理后中断")
@@ -248,8 +255,8 @@ def main_vla_logic(drone, client, instruction, args, program_stop_event, round_i
                 print("[VLA] 未收到有效动作，任务终止。")
                 break
 
-            # 检查当前批次是否是小增量，如果 max(|dx|, |dy|, |dz|, |dyaw|) < 1.0 cm/deg，则自动停止
-            if _is_action_batch_small(current_batch, threshold=1.0):
+            # 检查当前批次是否是小增量，如果 max(|dx|, |dy|, |dz|, |dyaw|) < 2.0 cm/deg，则自动停止
+            if _is_action_batch_small(current_batch, threshold=2.0):
                 print("[VLA] **动作增量过小，判定任务完成，自动终止。**")
                 drone.talk("动作增量过小，VLA任务自动完成")
                 vla_task_completed_flag.set()
@@ -304,7 +311,7 @@ def main_vla_logic(drone, client, instruction, args, program_stop_event, round_i
             next_batch_data = {} 
             llm_thread = threading.Thread(
                 target=llm_inference_wrapper, 
-                args=(drone, client, instruction, args, first_image, next_batch_data),
+                args=(drone, client, instruction, args, first_image, next_batch_data, base_proprio),
                 daemon=True
             )
             llm_thread.start()
@@ -581,17 +588,6 @@ if __name__ == "__main__":
         # 2. [!!] 阶段 1: 运行航点任务
         #     此函数将处理起飞、飞行航点，并在最后悬停
         run_waypoint_mission(drone)
-
-
-        # [!!] MODIFIED: Replaced f-string with .format() (in commented line)
-        # drone.land()
-        # time.sleep(10) # 等待稳定
-        # print("[VLA] 正在起飞...")
-        # drone.take_off()
-        # time.sleep(5) # 等待稳定
-        print("航迹飞行结束，解锁电机。")
-
-        drone.unlock()
 
         # 3. [!!] 阶段 2: 初始化 VLA 客户端
         print("\n--- [阶段 2: VLA 交互式控制] ---")

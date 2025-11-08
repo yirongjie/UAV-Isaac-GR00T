@@ -509,19 +509,6 @@ class DjiM4DDrone:
         relative_yaw_cw_deg = (current_abs_yaw_cw_deg - origin_yaw_cw_deg) % 360
         relative_yaw_ccw_deg = (360 - relative_yaw_cw_deg) % 360 
         return relative_yaw_ccw_deg
-    
-    def unlock(self):
-        """
-        向 PSDKServer 发送指令，启动无人机电机 (解锁)。
-        命令: "fc_motors"
-        """
-        print("尝试启动电机...")
-        if self._send_command("fc_motors"):
-            self.talk("电机已启动/无人机已解锁")
-            return True
-        else:
-            self.talk("电机启动/解锁失败")
-            return False
 
     def move_forward(self, distance: int) -> None:
         """
