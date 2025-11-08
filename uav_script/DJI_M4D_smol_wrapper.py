@@ -9,6 +9,7 @@ import threading
 import time
 import re  
 from functools import wraps
+import httpx
 
 import cv2
 import dotenv
@@ -114,7 +115,19 @@ def recv_all(sock, count):
 
 class DjiM4DDrone:
     def __init__(self):
-        self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+
+
+        # custom_http_client = httpx.Client(
+        #     hosts={"openrouter.ai": "104.18.2.115"} # <-- [!!] hosts 在这里
+        # )
+        # self.llm_client = OpenAI(
+        #         api_key=API_KEY, 
+        #         base_url=BASE_URL,
+        #         timeout=20.0,
+        #         http_client=custom_http_client  # <-- [!!] 关键在这里
+        # )
+
+        self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=30.0)
         
         self.host = "localhost"#"192.168.42.120"
         self.port = 8899
@@ -454,15 +467,15 @@ class DjiM4DDrone:
 
     def get_frame_vlm(self, sharpen: bool = True) -> np.ndarray:
         """Get the current frame from the drone. (For VLM models)
-        此函数返回一个 *完整尺寸* 的 BGR 图像 (960x720)
+        此函数返回一个 *完整尺寸* 的 BGR 图像 (480x360)
 
         Args:
             sharpen (bool, optional): Whether to apply sharpening and exposure adjustment. Defaults to True.
 
         Returns:
-            np.ndarray: The processed frame as a NumPy array (BGR format, 960x720).
+            np.ndarray: The processed frame as a NumPy array (BGR format, 480x360).
         """
-        resp = self._send_command("tp 720")
+        resp = self._send_command("tp 480")
         if resp.get("status") != "ok" or resp.get("type") != "image":
             print("[get_frame_vlm] 错误: 未能从 M4D 获取图像。")
             return None
@@ -1236,7 +1249,7 @@ class DjiM4DDrone:
             print(f"[fly_dynamic_kmz_mission_gps] 错误: C++ Server 报告执行失败: {resp.get('message')}")
             return False
         
-    def face_compare(self) -> bool:
+    def face_compare(self, local:bool = False) -> bool:
         """
         人脸比较。立刻 get_frame 获得一张图片和 /home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg 这张人图片对比相似度，
         大于50% (即 similarity > 0.5) 就判定是一个人，返回 True。
@@ -1250,7 +1263,6 @@ class DjiM4DDrone:
             return False
 
         reference_image_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg"
-        temp_current_frame_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_drone_face.jpg"
         model_file = "/open_app/models/LVFace/LVFace-B_Glint360K.onnx" 
 
         # 1. 初始化推理器
@@ -1264,24 +1276,29 @@ class DjiM4DDrone:
             self.talk("人脸识别模块初始化失败")
             return False
 
-        # 2. 获取无人机当前帧并保存
-        print("[face_compare] 正在从无人机获取当前帧 (使用 get_frame)...")
-        # get_frame() 返回 480x360 RGB numpy 数组
-        current_frame_rgb = self.get_frame_vlm() 
-        
-        if current_frame_rgb is None:
-            print("[face_compare] 错误: 从 get_frame() 未能获取图像。")
-            self.talk("获取当前图像失败")
-            return False
+        if not local:
+            temp_current_frame_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_drone_face.jpg"
+            # 2. 获取无人机当前帧并保存
+            print("[face_compare] 正在从无人机获取当前帧 (使用 get_frame)...")
+            # get_frame() 返回 480x360 RGB numpy 数组
+            current_frame_rgb = self.get_frame_vlm() 
+            
+            if current_frame_rgb is None:
+                print("[face_compare] 错误: 从 get_frame() 未能获取图像。")
+                self.talk("获取当前图像失败")
+                return False
 
-        # 将 RGB 帧转换为 BGR (LVFace 可能期望 BGR，但更重要的是保存)
-        # current_frame_bgr = cv2.cvtColor(current_frame_rgb, cv2.COLOR_RGB2BGR)
-        try:
-            cv2.imwrite(temp_current_frame_path, current_frame_rgb)
-        except Exception as e:
-            print(f"[face_compare] 错误: 保存当前帧到临时文件失败: {e}")
-            self.talk("保存临时图像失败")
-            return False
+            # 将 RGB 帧转换为 BGR (LVFace 可能期望 BGR，但更重要的是保存)
+            # current_frame_bgr = cv2.cvtColor(current_frame_rgb, cv2.COLOR_RGB2BGR)
+            try:
+                cv2.imwrite(temp_current_frame_path, current_frame_rgb)
+            except Exception as e:
+                print(f"[face_compare] 错误: 保存当前帧到临时文件失败: {e}")
+                self.talk("保存临时图像失败")
+                return False
+        else:
+            temp_current_frame_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_frame_vlm.png"
+
             
         # 3. 提取特征
         try:
@@ -1312,22 +1329,200 @@ class DjiM4DDrone:
             print(f"[face_compare] 相似度分数: {similarity:.6f}")
 
             # 5. 判断
-            similarity_threshold = 0.3
+            similarity_threshold = 0.5
             if similarity > similarity_threshold:
-                self.talk(f"匹配成功，相似度 {similarity:.2f} 大于百分之五十")
+                self.talk(f"[face_compare] ==========================   匹配成功，相似度 {similarity*100:.2f}% 大于{similarity_threshold*100}%")
                 return True
             else:
-                self.talk(f"未找到匹配的人，相似度 {similarity:.2f} 不足百分之五十")
+                self.talk(f"[face_compare] ==========================   未找到匹配的人，相似度 {similarity*100:.2f}% 不足{similarity_threshold*100}%")
                 return False
 
         except Exception as e:
             print(f"[face_compare] 人脸识别过程中发生错误: {e}")
             self.talk("人脸识别过程中发生错误")
             return False
-        # finally:
-             # 清理临时文件
-            # if os.path.exists(temp_current_frame_path):
-            #     os.remove(temp_current_frame_path)
+
+        
+    def scan_for_person(self) -> dict:
+        """
+        [!! 已按新逻辑修改 !!]
+        实现 "VLM检测person + 独立face_compare验证" 逻辑来寻找 person_A。
+        在每个角度：
+        1. 调用 objects_vlm(["person"]) 获取所有人的 3D 框。
+        2. 如果 VLM 找到了至少一个 "person"：
+        3.    **立即**调用 *原始* face_compare() (它会自己抓取一帧) 来验证当前画面中是否有 person_A。
+        4.    如果 face_compare() 返回 True (匹配成功):
+        5.       我们假设 VLM 找到的第一个 "person" 就是 person_A。
+        6.       返回这个 "person" 的 3D 坐标。
+        7. 如果 VLM 没找到 "person" 或 face_compare() 返回 False:
+        8.    旋转 45 度并重复。
+        
+        如果 360 度扫描（包括平移）后未找到，返回 None。
+
+        Returns:
+            dict: 包含 person_A 坐标的字典 (e.g., {'x': 0.1, 'y': 0.2, 'z': 2.5})，
+                  如果未找到则返回 None。
+        """
+        
+        def check_current_view() -> dict:
+            """(内部函数) 检查当前单一视图"""
+            print("[scan_for_person] 正在检查当前视图 (VLM find person + face_compare verify)...")
+            
+            # 1. VLM 检测所有人
+            #    (让它自己抓取帧, 传入 frame_to_check=None)
+            all_persons = self.objects_vlm(["person"]) 
+            
+            if not all_persons:
+                print("[scan_for_person] VLM 未检测到 'person'。")
+                return None
+                
+            print(f"[scan_for_person] VLM 找到 {len(all_persons)} 个 'person'。正在调用 face_compare 验证...")
+
+            # 2. 调用 *原始* face_compare 进行独立验证
+            #    (这个函数会自己调用 get_frame_vlm())
+            try:
+                is_person_A = self.face_compare(True) 
+            except Exception as e:
+                print(f"[scan_for_person] face_compare() 执行时出错: {e}")
+                return None
+
+            # 3. 检查验证结果
+            if is_person_A:
+                print(f"[scan_for_person] face_compare 验证成功! 找到 person_A。")
+                
+                # 4. 假设 VLM 找到的第一个人就是 person_A, 返回其 3D 坐标
+                person_data = all_persons[0] # 逻辑假设：VLM 找到的第一个人就是目标
+                
+                x_m = person_data.get("x", 0)
+                y_m = person_data.get("y", 0)
+                z_m = person_data.get("z", 0)
+
+                if z_m <= 0:
+                     print(f"[scan_for_person] face_compare 成功, 但 VLM 返回无效 Z 距离 ({z_m})。")
+                     return None
+                
+                return {"x": x_m, "y": y_m, "z": z_m}
+            else:
+                # face_compare 已经 self.talk("未找到匹配的人...")
+                print(f"[scan_for_person] face_compare 验证失败 (未匹配)。")
+                return None
+        
+        # --- scan_for_person 主循环 (保持不变) ---
+
+        # (M4D) 原地360度扫描
+        for i in range(8):
+            result_3d = check_current_view()
+            if result_3d:
+                print(f"[scan_for_person] 在第 {i+1} 次尝试 (旋转 {i*45} 度) 时找到 person_A。")
+                return result_3d
+            print(f"[scan_for_person] 第 {i+1}/8 次尝试 (原地) 未找到 person_A，逆时针旋转 45 度...")
+            self.turn_counter_clockwise(45)
+
+        # (M4D) 向左 1.5m, 扫描360度
+        print("[scan_for_person] 原地扫描失败。向左移动 150cm...")
+        self.move_left(150) 
+        for i in range(8):
+            result_3d = check_current_view()
+            if result_3d:
+                print(f"[scan_for_person] 在左侧 {i+1} 次尝试时找到 person_A。")
+                return result_3d
+            print(f"[scan_for_person] 第 {i+1}/8 次尝试 (左侧) 未找到 person_A，逆时针旋转 45 度...")
+            self.turn_counter_clockwise(45)
+
+        # (M4D) 向右 3m, 扫描360度
+        print("[scan_for_person] 左侧扫描失败。向右移动 300cm (穿过原点)...")
+        self.move_right(300) 
+        for i in range(8):
+            result_3d = check_current_view()
+            if result_3d:
+                print(f"[scan_for_person] 在右侧 {i+1} 次尝试时找到 person_A。")
+                return result_3d
+            print(f"[scan_for_person] 第 {i+1}/8 次尝试 (右侧) 未找到 person_A，逆时针旋转 45 度...")
+            self.turn_counter_clockwise(45)
+
+        # (M4D) 回到原点
+        print("[scan_for_person] 右侧扫描失败。返回起始水平位置...")
+        self.move_left(150)
+
+        print("[scan_for_person] 所有扫描尝试均失败。")
+        return None
+        
+    def move_to_person(
+        self, target_distance_cm: int, target_height_cm: int = 0
+    ) -> bool:
+        """
+        [!! 新增 !!]
+        扫描、对准并移动到特定人员 (person_A) 前方的特定距离和高度。
+        该函数会执行以下四步操作：
+        1. 使用 scan_for_person 找到 person_A (结合了 VLM 2D/3D 检测 和 人脸识别)。
+        2. 根据 person_A 的x坐标，自动旋转无人机，将其对准到视野中心。
+        3. 根据 person_A 的y坐标，自动升降无人机，将其对准到视野中心。
+        4. 根据 person_A 的z坐标，前进到目标距离。
+
+        Args:
+            target_distance_cm (int): 最终希望与 person_A 保持的距离（单位：厘米）。
+            target_height_cm (int, optional): 希望与 person_A 保持的垂直距离（单位：厘米），默认0。
+
+        Returns:
+            bool: 操作是否成功完成。成功返回True, 如果 person_A 未找到或移动失败，返回 False。
+        """
+        print(f"开始执行 move_to_person: 目标 'person_A', 距离 {target_distance_cm}cm")
+        
+        # [!!] 调用新的 scan_for_person
+        scan_result_3d = self.scan_for_person() 
+        
+        if scan_result_3d is None:
+            print(f"未找到目标 'person_A'，无法执行 move_to_person。")
+            self.talk("未找到目标人物")
+            return False
+            
+        # 目标已确认是 person_A
+        x_m = scan_result_3d.get("x", 0)
+        y_m = scan_result_3d.get("y", 0)
+        z_m = scan_result_3d.get("z", 0)
+        
+        if z_m <= 0:
+            print(f"VLM 返回无效 Z 距离 ({z_m})，无法计算移动。")
+            self.talk("目标距离无效")
+            return False
+            
+        actions_taken = []
+        horizontal_threshold_m = 0.05
+        
+        # 1. 对准 X (左右)
+        if abs(x_m) > horizontal_threshold_m:
+            angle_rad = math.atan(x_m / z_m); angle_deg = int(math.degrees(angle_rad))
+            if angle_deg > 0:
+                print(f"目标在右侧，需向右转 {angle_deg} 度。")
+                self.turn_clockwise(angle_deg); actions_taken.append(f"向右转 {angle_deg} 度")
+            elif angle_deg < 0:
+                print(f"目标在左侧，需向左转 {abs(angle_deg)} 度。")
+                self.turn_counter_clockwise(abs(angle_deg)); actions_taken.append(f"向左转 {abs(angle_deg)} 度")
+                
+        # 2. 对准 Y (上下)
+        vertical_threshold_m = 0.05
+        vertical_error_m = y_m - (target_height_cm / 100.0); move_z_cm = int(vertical_error_m * 100)
+        
+        if abs(move_z_cm) > int(vertical_threshold_m * 100):
+            if move_z_cm > 0:
+                print(f"目标在下方，需下降 {move_z_cm} cm。"); self.move_down(move_z_cm); actions_taken.append(f"下降 {move_z_cm} cm")
+            else:
+                print(f"目标在上方，需上升 {abs(move_z_cm)} cm。"); self.move_up(abs(move_z_cm)); actions_taken.append(f"上升 {abs(move_z_cm)} cm")
+                
+        # 3. 对准 Z (前后)
+        current_distance_cm = int(z_m * 100); move_distance_cm = current_distance_cm - target_distance_cm
+        
+        if move_distance_cm > 20: # 最小移动阈值
+            print(f"正在前进 {move_distance_cm} cm。"); self.move_forward(min(move_distance_cm, 500)); actions_taken.append(f"前进 {move_distance_cm} cm")
+        elif move_distance_cm < -20: # 最小移动阈值
+            print(f"正在后退 {abs(move_distance_cm)} cm。"); self.move_backward(min(abs(move_distance_cm), 500)); actions_taken.append(f"后退 {abs(move_distance_cm)} cm")
+            
+        if not actions_taken:
+            print("person_A 已经在目标位置，无需移动。"); return False
+        else:
+            print("完成 move_to_person 操作，动作包括: " + ", ".join(actions_taken))
+            self.talk("已移动到目标人物面前")
+            return True
        
     def shutdown(self):
         """
