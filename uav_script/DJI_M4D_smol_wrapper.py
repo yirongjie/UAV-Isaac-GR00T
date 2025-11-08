@@ -510,38 +510,18 @@ class DjiM4DDrone:
         relative_yaw_ccw_deg = (360 - relative_yaw_cw_deg) % 360 
         return relative_yaw_ccw_deg
     
-    # def recalibrate_local_state(self):
-    #     """
-    #     重置本地航位推算状态 (x, y) 并重新设置原点 (GPS/Yaw)，
-    #     假设无人机已在空中悬停。此过程不发送任何起飞/降落指令。
-    #     """
-    #     # [修改] 1. 调用新的 C++ 命令，执行 Release/Obtain/Hover 周期以强制解锁
-    #     print("[校准] 正在执行 C++ 端 Release/Obtain 周期以强制解锁飞控...")
-    #     resp = self._send_command("fc_regain_ctrl") 
-        
-    #     if resp.get("status") != "ok":
-    #          # 如果解锁命令失败，后续 VLA 任务很可能会失败。
-    #          print("[校准] 严重错误: C++ 端 'fc_regain_ctrl' 命令失败。请手动摇杆解锁。")
-    #     else:
-    #          print("[校准] C++ 端控制权重新获取成功。")
-
-    #     # 2. 重置本地航位推算坐标
-    #     self.x = 0.0
-    #     self.y = 0.0
-        
-    #     # 3. 重新获取并设置原点姿态 (关键步骤)
-    #     time.sleep(1) # 等待 PSDK 状态稳定
-    #     pose = self._get_realtime_pose()
-    #     print("[校准] 状态校准成功。")
-    #     if pose.get("lat") != 0.0 or pose.get("lon") != 0.0:
-    #         self.origin_lat = pose["lat"]
-    #         self.origin_lon = pose["lon"]
-    #         self.origin_alt_m = pose["alt_m"]
-    #         self.origin_yaw_deg = pose["yaw_deg"] 
-    #         print(f"[校准] 新原点已设置: Lat={self.origin_lat}, Lon={self.origin_lon}, Alt={self.origin_alt_m}m, Yaw={self.origin_yaw_deg}deg (CW North)")
-    #     else:
-    #         print("[校准] 警告: 状态校准后未能获取原点 GPS/Yaw。")
-    #         self.origin_yaw_deg = 0.0
+    def unlock(self):
+        """
+        向 PSDKServer 发送指令，启动无人机电机 (解锁)。
+        命令: "fc_motors"
+        """
+        print("尝试启动电机...")
+        if self._send_command("fc_motors"):
+            self.talk("电机已启动/无人机已解锁")
+            return True
+        else:
+            self.talk("电机启动/解锁失败")
+            return False
 
     def move_forward(self, distance: int) -> None:
         """

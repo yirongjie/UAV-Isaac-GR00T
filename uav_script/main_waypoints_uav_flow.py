@@ -589,8 +589,9 @@ if __name__ == "__main__":
         # print("[VLA] 正在起飞...")
         # drone.take_off()
         # time.sleep(5) # 等待稳定
+        print("航迹飞行结束，解锁电机。")
 
-        # drone.recalibrate_local_state()
+        drone.unlock()
 
         # 3. [!!] 阶段 2: 初始化 VLA 客户端
         print("\n--- [阶段 2: VLA 交互式控制] ---")
