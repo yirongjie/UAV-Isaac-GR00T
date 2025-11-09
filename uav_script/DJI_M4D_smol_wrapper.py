@@ -32,9 +32,14 @@ except ImportError:
     Gr00tClient = None
 from PIL import Image
 
-API_VL_MODEL = "qwen/qwen3-vl-30b-a3b-instruct"
-BASE_URL = "https://openrouter.ai/api/v1"
+API_VL_MODEL = "qwen3-vl-30b-a3b-instruct"# "qwen/qwen3-vl-30b-a3b-instruct"
+BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1" #"https://openrouter.ai/api/v1"
 API_KEY = os.environ["OPENROUTER_API_KEY"]
+
+
+# API_VL_MODEL = "gpt-3.5-turbo"
+# BASE_URL = "http://0.0.0.0:9999/v1"
+# API_KEY = "sk-fake-key"
 
 class LocalSpeaker:
     """
@@ -115,19 +120,7 @@ def recv_all(sock, count):
 
 class DjiM4DDrone:
     def __init__(self):
-
-
-        # custom_http_client = httpx.Client(
-        #     hosts={"openrouter.ai": "104.18.2.115"} # <-- [!!] hosts 在这里
-        # )
-        # self.llm_client = OpenAI(
-        #         api_key=API_KEY, 
-        #         base_url=BASE_URL,
-        #         timeout=20.0,
-        #         http_client=custom_http_client  # <-- [!!] 关键在这里
-        # )
-
-        self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=30.0)
+        self.llm_client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=300.0)
         
         self.host = "localhost"#"192.168.42.120"
         self.port = 8899
@@ -528,7 +521,7 @@ class DjiM4DDrone:
         Move the drone forward by a specified distance in centimeters.
 
         Args:
-            distance (int): The distance to move forward in centimeters.必须是正数
+            distance (int): The distance to move forward in centimeters. 必须是正数
         """
         dist_m = distance / 100.0
         yaw_rad_ccw = math.radians(self._get_current_relative_yaw_ccw_deg())
@@ -541,7 +534,7 @@ class DjiM4DDrone:
         Move the drone backward by a specified distance in centimeters.
 
         Args:
-            distance (int): The distance to move backward in centimeters.必须是正数
+            distance (int): The distance to move backward in centimeters. 必须是正数
         """
         dist_m = distance / 100.0
         yaw_rad_ccw = math.radians(self._get_current_relative_yaw_ccw_deg())

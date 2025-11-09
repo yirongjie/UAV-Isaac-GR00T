@@ -170,9 +170,7 @@ class SimpleToolCallingAgent:
         self.system_prompt = self._build_system_prompt(system_prompt_template, tools)
         self.messages_history = []
         
-        # 用于从响应中提取 Action JSON 的正则表达式
-        # (这匹配 'Action:' 直到 '}' 或 '```')
-        self.action_regex = re.compile(r"Action:[\s\S]*?(\{[\s\S]*\})", re.DOTALL | re.IGNORECASE)
+        self.action_regex = re.compile(r"Action:[\s\S]*?(\{[\s\S]*?\})(?=Action:|final_answer:|$)", re.DOTALL | re.IGNORECASE)
         self.final_answer_regex = re.compile(r"final_answer:\s*(.*)", re.DOTALL | re.IGNORECASE)
 
     def _build_system_prompt(self, template: str, tools: list) -> str:
@@ -208,12 +206,13 @@ class SimpleToolCallingAgent:
 
     def run(self, prompt: str, images=None):
         """
-        执行代理的 "思考->行动->观察" 循环
+        执行代理的 "思考->行动->观察" 循环。
+        【终极修复版本】：手动分割 Action 片段 + 极度激进的清洗 + 大括号计数。
         """
         if images:
             print("警告: SimpleToolCallingAgent (非VLM模式) 不支持图像输入，图像将被忽略。")
 
-        # 1. 初始化
+        # 1. 初始化 (保持不变)
         self.messages_history = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": prompt}
@@ -223,6 +222,8 @@ class SimpleToolCallingAgent:
         print(self.system_prompt)
         print("-----------------")
         print(f"\n--- 开始执行任务: {prompt} ---")
+
+        final_answer_match = None 
 
         for step in range(self.max_steps):
             print(f"\n--- 步骤 {step + 1}/{self.max_steps} ---")
@@ -234,88 +235,151 @@ class SimpleToolCallingAgent:
             self.messages_history.append({"role": "assistant", "content": llm_response_text})
             print(f"\n[思考/行动]\n{llm_response_text}")
 
-            # 2. 检查是否为最终答案
+            # 2. 解析所有行动 (Actions) - 放弃正则 finditer，使用手动分割
             final_answer_match = self.final_answer_regex.search(llm_response_text)
-            if final_answer_match:
-                final_answer = final_answer_match.group(1).strip()
-                print(f"\n--- 任务完成 (检测到 final_answer) ---")
-                print(f"最终答案: {final_answer}")
-                break
-
-            # 3. 解析行动 (Action)
-            action_match = self.action_regex.search(llm_response_text)
-            if not action_match:
-                print("\n[观察] 错误：模型未提供有效的 'Action:' JSON。正在请求重试...")
-                self.messages_history.append({"role": "user", "content": "你没有提供有效的 'Action:' JSON 块。请思考并提供一个工具调用。"})
-                continue
+            actions_to_execute = []
             
-            # 提取 JSON 字符串 (优先匹配 ```json ... ```)
-            json_str = action_match.group(1)
+            # 查找所有 Action: 的起始位置
+            action_starts = [m.start() for m in re.finditer(r"Action:", llm_response_text, re.IGNORECASE | re.DOTALL)]
             
-            try:
-                json_str_cleaned = json_str.replace("\u00A0", " ")
-                action_json = json.loads(json_str_cleaned.strip())
+            for i, start_index in enumerate(action_starts):
                 
+                # 确定当前 Action 片段的结束点 (下一个 Action 的起始，或文本末尾)
+                if i + 1 < len(action_starts):
+                    segment_end_index = action_starts[i+1]
+                else:
+                    segment_end_index = len(llm_response_text)
+                
+                # 当前 Action 的原始文本片段
+                json_str_segment = llm_response_text[start_index : segment_end_index]
+                
+                json_to_load = ""
+                try:
+                    # 1. 找到起始 '{'
+                    json_start = json_str_segment.find('{')
+                    if json_start == -1:
+                        raise ValueError("No starting '{' found.")
+
+                    # 2. 预清理：移除 BOM 标记，并扁平化 JSON 结构
+                    raw_content = json_str_segment[json_start:].lstrip('\ufeff')
+                    
+                    # 3. 替换所有空白符、非标准字符、控制字符为标准空格
+                    raw_content_super_clean = re.sub(r'[\s\u00A0\x00-\x1F\x7F]', ' ', raw_content) 
+                    json_str_super_clean = ' '.join(raw_content_super_clean.split())
+                    
+                    # 4. 大括号计数逻辑 (找到平衡的闭合 '}')
+                    brace_count = 0
+                    json_end = -1
+                    in_string = False
+                    
+                    for k in range(len(json_str_super_clean)):
+                        char = json_str_super_clean[k]
+                        
+                        if char == '"' and (k == 0 or json_str_super_clean[k-1] != '\\'):
+                            in_string = not in_string
+                        
+                        if not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    json_end = k
+                                    break
+                    
+                    if json_end == -1:
+                        raise ValueError("Closing '}' was not found/balanced.")
+                    
+                    # 5. 最终切片和加载
+                    json_to_load = json_str_super_clean[0 : json_end + 1]
+                    action_json = json.loads(json_to_load)
+                    actions_to_execute.append(action_json)
+
+                except Exception as e:
+                    # 在最终版本中，应该重新启用 try/except
+                    print(f"\n[观察] 错误：解析 Action JSON 失败: {e}. 尝试解析的 JSON 字符串: {json_to_load}. 跳过此 Action。")
+                    continue
+            
+            # 3. 任务结束判断逻辑 (不变)
+            if not actions_to_execute:
+                if final_answer_match:
+                    final_answer = final_answer_match.group(1).strip()
+                    print(f"\n--- 任务完成 (检测到 final_answer，且没有 Action 需要执行) ---")
+                    print(f"最终答案: {final_answer}")
+                    break
+                else:
+                    print("\n[观察] 错误：模型未提供有效的 Action 或 final_answer。正在请求重试...")
+                    self.messages_history.append({"role": "user", "content": "你没有提供任何有效的 Action 或 final_answer。请思考并提供一个工具调用或任务总结。"})
+                    continue
+
+            # 4. 顺序执行所有工具 (保持不变)
+            all_observations = []
+            execution_successful = True
+            for action_json in actions_to_execute:
                 tool_name = action_json.get("name")
                 tool_args = action_json.get("arguments", {})
                 
                 if not tool_name:
-                    raise ValueError("Action JSON 中缺少 'name' 字段。")
-                
-                print(f"调用工具: {tool_name}({tool_args})")
-                
-            except json.JSONDecodeError as e:
-                print(f"\n[观察] 错误：解析 Action JSON 失败: {e}")
-                print(f"原始 JSON 字符串: {json_str}")
-                self.messages_history.append({"role": "user", "content": f"解析 Action JSON 失败: {e}。请检查你的 JSON 格式。"})
-                continue
-            except ValueError as e:
-                print(f"\n[观察] 错误：Action JSON 格式无效: {e}")
-                self.messages_history.append({"role": "user", "content": f"Action JSON 格式无效: {e}。"})
-                continue
+                    all_observations.append("Action failed: Missing 'name' field.")
+                    execution_successful = False
+                    break 
 
-            # 4. 执行工具
-            try:
-                tool_to_call = self.drone_instance.get_tool_by_name(tool_name)
-                
-                # 转换参数类型（LLM 总是返回字符串或数字）
-                # 我们的工具需要特定类型（例如 int）
-                sig = inspect.signature(tool_to_call)
-                typed_args = {}
-                for param_name, param in sig.parameters.items():
-                    if param_name in tool_args:
-                        arg_val = tool_args[param_name]
-                        if param.annotation == int:
-                            typed_args[param_name] = int(float(arg_val)) # 允许 LLM 发送 100.0
-                        elif param.annotation == float:
-                            typed_args[param_name] = float(arg_val)
-                        else:
-                            typed_args[param_name] = arg_val # 默认为 str 或 list
-                
-                observation = tool_to_call(**typed_args)
-                
-                # 将观察结果格式化为字符串
-                if observation is None:
-                    observation_str = "操作已执行，无返回值。"
-                else:
-                    observation_str = str(observation)
-                
-                print(f"\n[观察]\n{observation_str}")
-                
-                # 不使用 OpenAI 的 'tool_call' role
-                # 按照 YAML 提示，只添加一个 "Observation: ..." 的用户消息
-                # (或者我们可以用 'tool' role，但必须伪造 tool_call_id。简单起见，使用用户消息)
-                self.messages_history.append({"role": "user", "content": f"Observation: {observation_str}"})
+                try:
+                    tool_to_call = self.drone_instance.get_tool_by_name(tool_name)
+                    
+                    # 转换参数类型（LLM 总是返回字符串或数字）
+                    sig = inspect.signature(tool_to_call)
+                    typed_args = {}
+                    for param_name, param in sig.parameters.items():
+                        if param_name in tool_args:
+                            arg_val = tool_args[param_name]
+                            if param.annotation == int:
+                                typed_args[param_name] = int(float(arg_val)) 
+                            elif param.annotation == float:
+                                typed_args[param_name] = float(arg_val)
+                            else:
+                                typed_args[param_name] = arg_val 
+                    
+                    print(f"调用工具: {tool_name}({typed_args})")
+                    observation = tool_to_call(**typed_args)
+                    
+                    # 记录每个动作的观察结果
+                    obs_text = f"Action '{tool_name}' executed. Result: {str(observation)}"
+                    all_observations.append(obs_text)
 
-            except Exception as e:
-                print(f"\n[观察] 错误：执行工具 '{tool_name}' 失败: {e}")
-                self.messages_history.append({"role": "user", "content": f"错误：执行工具 '{tool_name}' 失败: {e}。请重新规划。"})
+                except Exception as e:
+                    # 如果任何 Action 失败，立即记录错误并设置标志位
+                    error_msg = f"错误：执行工具 '{tool_name}' 失败: {e}"
+                    print(f"\n[观察] {error_msg}. 停止本步骤后续操作。")
+                    all_observations.append(f"Action '{tool_name}' failed. Error: {e}")
+                    execution_successful = False
+                    import traceback; traceback.print_exc()
+                    break 
+
+            # 5. 合并观察结果并结束本步骤 (保持不变)
+            combined_observation_str = "Observation: \n" + "\n".join(all_observations)
+            print(f"\n[观察]\n{combined_observation_str}")
+            
+            # 将合并的观察结果作为用户消息传回给 LLM
+            self.messages_history.append({"role": "user", "content": combined_observation_str})
+
+            # 6. 检查 final_answer (保持不变)
+            if final_answer_match and execution_successful:
+                 final_answer = final_answer_match.group(1).strip()
+                 print(f"\n--- 任务完成 (检测到 final_answer，且所有 Actions 成功) ---")
+                 print(f"最终答案: {final_answer}")
+                 break
 
         if step == self.max_steps - 1:
             print(f"\n--- 已达到最大步骤 ({self.max_steps})，任务终止 ---")
+            
+        # 确保在退出前捕获最后的 final_answer
+        if final_answer_match:
+             if 'final_answer:' not in self.messages_history[-1]['content']:
+                final_answer = final_answer_match.group(1).strip()
+                print(f"最终答案: {final_answer}")
 
-
-
+                
 # --- Agent 配置 ---
 # (我们只实现了 ToolCallingAgent)
 AGENT_CLASS_MAP = {
@@ -564,7 +628,7 @@ def agent_main():
         1. 先去白板上看一下，说出白板上写了什么物品。
         2. 然后找到货架，说出货架上全部物品，然后说出货架上的货物种类是否满足发货要求。
         3. 如果有缺少货物，告诉我缺少什么，在周围查找散落的缺少的目标货物，并对在他面前1米降落。"""
-        prompt = "起飞，向前飞行10米，后降落。"
+        prompt = "起飞，向前飞行1000厘米，后降落。"
         
         agent.run(prompt) #  调用我们新代理的 run 方法
 
