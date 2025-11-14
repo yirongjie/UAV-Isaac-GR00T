@@ -1650,7 +1650,7 @@ class DjiM4DDrone:
             try:
                 from aip import AipFace
                 
-                client = AipFace(_API_APP_ID, _API_KEY, _SECRET_KEY) # 建议提取为常量
+                client = AipFace(BAIDU_API_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY) # 建议提取为常量
                 
                 with open(reference_image_path, 'rb') as f: ref_b64 = base64.b64encode(f.read()).decode()
                 with open(temp_cropped_face_path, 'rb') as f: cur_b64 = base64.b64encode(f.read()).decode()
@@ -2390,7 +2390,7 @@ class DjiM4DDrone:
                         with open(ref_path, 'rb') as f: ref_b64 = base64.b64encode(f.read()).decode()
                         with open(temp_crop_path, 'rb') as f: cur_b64 = base64.b64encode(f.read()).decode()
                         
-                        client = AipFace(_API_APP_ID, _API_KEY, _SECRET_KEY)
+                        client = AipFace(BAIDU_API_APP_ID, BAIDU_API_KEY, BAIDU_SECRET_KEY)
                         images = [
                             {'image': ref_b64, 'image_type': 'BASE64', 'face_type': 'LIVE', 'quality_control': 'LOW'},
                             {'image': cur_b64, 'image_type': 'BASE64', 'face_type': 'LIVE', 'quality_control': 'LOW'}
