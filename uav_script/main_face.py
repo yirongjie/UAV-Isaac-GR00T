@@ -1,13 +1,7 @@
 import time
 import sys
 
-# 假设您的无人机封装类保存在名为 'DJI_M4D_smol_wrapper.py' 的文件中
-try:
-    from DJI_M4D_smol_wrapper import DjiM4DDrone
-except ImportError:
-    print("错误: 未找到 'DJI_M4D_smol_wrapper.py' 文件。")
-    print("请确保 main.py 与 DJI_M4D_smol_wrapper.py 在同一目录下。")
-    sys.exit(1)
+from DJI_M4D_smol_wrapper import DjiM4DDrone
 
 def main():
     """
@@ -36,13 +30,15 @@ def main():
 
         # --- 2. 执行 move_to_person ---
         # 目标：移动到 person_A 面前 2.5 米 (250 厘米) 处
-        target_dist_cm = 150
+        target_dist_cm = 250
         print(f"[Main] 开始执行 move_to_person，目标距离 {target_dist_cm} 厘米...")
         drone.talk("开始搜索目标人物")
         
-        success = drone.move_to_person(
+        success = drone.move_to_person_2(
             target_distance_cm=target_dist_cm, 
-            target_height_cm=0  # 保持与目标人物中心等高
+            target_height_cm=0,  # 保持与目标人物中心等高
+            use_api=False,
+            use_depth_model= True
         )
 
         if success:
@@ -54,6 +50,8 @@ def main():
 
         print("[Main] 任务执行完毕，准备降落。")
         time.sleep(2)
+        drone.land()
+        time.sleep(5)
 
     except KeyboardInterrupt:
         print("\n[Main] 检测到用户中断 (Ctrl+C)。")

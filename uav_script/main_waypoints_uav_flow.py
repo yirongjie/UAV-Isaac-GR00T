@@ -434,7 +434,7 @@ def run_waypoint_mission(drone):
         print(f"  -> 航线基准点: Lat={base_lat:.6f}, Lon={base_lon:.6f}, Alt={base_alt:.1f}m")
 
         # --- 规划 3 个绝对航点 ---
-        lat_1, lon_1 = calculate_new_gps(base_lat, base_lon, 20.0, 20.0)
+        lat_1, lon_1 = calculate_new_gps(base_lat, base_lon, 2.0, -0.0)
         # lat_2, lon_2 = calculate_new_gps(lat_1, lon_1, -10.0, 30.0)
         # lat_3, lon_3 = calculate_new_gps(lat_2, lon_2, 10.0, -10.0)
 

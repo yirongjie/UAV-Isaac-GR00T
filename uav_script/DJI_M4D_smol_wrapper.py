@@ -10,11 +10,23 @@ import time
 import re  
 from functools import wraps
 import httpx
+from aip import AipFace
+from typing import Dict, Any
 
+import glob
+import os
+import torch
 import cv2
 import dotenv
 import numpy as np
 from openai import OpenAI
+from ultralytics import YOLO
+# --- 新增阿里云 FaceBody imports ---
+from alibabacloud_facebody20191230.client import Client as AliClient
+from alibabacloud_facebody20191230.models import CompareFaceAdvanceRequest
+from alibabacloud_tea_openapi.models import Config as AliConfig
+from alibabacloud_tea_util.models import RuntimeOptions
+# --------------------------------
 
 # --- M4D 特有的库 ---
 import socket
@@ -32,6 +44,28 @@ except ImportError:
     Gr00tClient = None
 from PIL import Image
 
+try:
+    from depth_anything_v2.dpt import DepthAnythingV2 # <-- 新增
+except ImportError:
+    print("[Drone Wrapper] 警告: 未找到 'depth_anything_v2'。move_to_person_2 (深度模型) 将不可用。")
+    DepthAnythingV2 = None
+model_configs = {
+    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
+    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
+    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
+    'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
+}
+
+
+
+
+
+
+
+
+
+
+
 API_VL_MODEL = "qwen3-vl-30b-a3b-instruct"# "qwen/qwen3-vl-30b-a3b-instruct"
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1" #"https://openrouter.ai/api/v1"
 API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -40,6 +74,14 @@ API_KEY = os.environ["OPENROUTER_API_KEY"]
 # API_VL_MODEL = "gpt-3.5-turbo"
 # BASE_URL = "http://0.0.0.0:9999/v1"
 # API_KEY = "sk-fake-key"
+
+
+BAIDU_API_APP_ID = os.environ["BAIDU_API_APP_ID"]
+BAIDU_API_KEY = os.environ["BAIDU_API_KEY"]
+BAIDU_SECRET_KEY = os.environ["BAIDU_SECRET_KEY"]
+
+ALIBABA_CLOUD_ACCESS_KEY_ID=os.environ["ALIBABA_CLOUD_ACCESS_KEY_ID"]
+ALIBABA_CLOUD_ACCESS_KEY_SECRET=os.environ["ALIBABA_CLOUD_ACCESS_KEY_SECRET"]
 
 class LocalSpeaker:
     """
@@ -145,6 +187,22 @@ class DjiM4DDrone:
 
         print(f"DjiM4DDrone wrapper initialized for persistent connection to {self.host}:{self.port}")
 
+        # self.yolo_model = None
+        
+        self.yolo_model_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/yolov11n-face.pt" # 确保此文件在运行目录下，或写绝对路径
+        self.yolo_model = YOLO(self.yolo_model_path).to("cuda") 
+
+        
+        self.inferencer = LVFaceONNXInferencer(model_path="/open_app/models/LVFace/LVFace-B_Glint360K.onnx", use_gpu=True)
+
+        self.depth_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.depth_model = None # 懒加载 (Lazy load)
+        if self.depth_model is None:
+            if not self._load_depth_model():
+                print("[_get_xyz_from_depth_model] 错误: 深度模型无法加载。")
+
+
+
         # --- VLA 客户端初始化 (保持不变) ---
         self.vla_client = None
         self.vla_model_type = 'gr00t'
@@ -240,6 +298,7 @@ class DjiM4DDrone:
             "objects_vlm",
             "scan",
             "move_to_object",
+
             "take_picture",
             "talk",
         ]
@@ -296,7 +355,7 @@ class DjiM4DDrone:
         try:
             print(f"[_connect] 正在连接到 {self.host}:{self.port}...")
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(5.0) 
+            self.socket.settimeout(500.0) 
             self.socket.connect((self.host, self.port))
             print("[_connect] 连接已建立。")
             return True
@@ -331,7 +390,7 @@ class DjiM4DDrone:
                     if not self._connect():
                         return {"status": "error", "message": "Reconnect failed"}
                 
-                self.socket.settimeout(10.0) 
+                self.socket.settimeout(500.0) 
                 self.socket.sendall(command.encode('utf-8'))
 
                 resp_data = recv_all(self.socket, 4)
@@ -348,7 +407,7 @@ class DjiM4DDrone:
                     if img_size == 0:
                         print(f"[_send_command] 错误: 服务器报告拍照失败 (收到 0 字节)。")
                         return {"status": "error", "message": "Take photo failed on server"}
-                    self.socket.settimeout(10.0)
+                    self.socket.settimeout(500.0)
                     img_data = recv_all(self.socket, img_size)
                     if not img_data or len(img_data) != img_size:
                         print(f"[_send_command] 错误: 接收图像数据不完整。")
@@ -360,7 +419,7 @@ class DjiM4DDrone:
                     if json_size == 0:
                         print(f"[_send_command] 错误: 服务器报告 '{cmd_name}' 失败。")
                         return {"status": "error", "message": f"{cmd_name} failed on server"}
-                    self.socket.settimeout(5.0)
+                    self.socket.settimeout(500.0)
                     json_data_raw = recv_all(self.socket, json_size)
                     if not json_data_raw:
                         print(f"[_send_command] 错误: 接收 JSON 数据不完整。")
@@ -417,7 +476,20 @@ class DjiM4DDrone:
             except Exception as e:
                 print(f"[_send_command] 发生错误 @ cmd: {cmd_name}: {e}")
                 return {"status": "error", "message": f"Unknown error: {e}"}
-            
+    
+    def shutdown(self):
+        """
+        关闭与 C++ PSDKServer 的持久连接。
+        """
+        print("DjiM4DDrone wrapper shutting down...")
+        with self.command_lock:
+            if self.socket:
+                try:
+                    self.socket.close()
+                except Exception as e:
+                    print(f"[shutdown] 关闭套接字时出错: {e}")
+                self.socket = None
+        print("DjiM4DDrone wrapper shutdown complete.") 
 
     # -----#
 
@@ -458,17 +530,27 @@ class DjiM4DDrone:
         cv2.imwrite("current_frame.png", frame_bgr) 
         return frame_rgb
 
-    def get_frame_vlm(self, sharpen: bool = True) -> np.ndarray:
+    def get_frame_vlm(self, res_param: int = 480) -> np.ndarray:
         """Get the current frame from the drone. (For VLM models)
-        此函数返回一个 *完整尺寸* 的 BGR 图像 (480x360)
+        此函数返回一个 BGR 图像。图像的实际分辨率取决于 C++ Server 对 res_param 的响应，
+        通常为 480p 或 1080p（如果 res_param=1080）。
 
         Args:
-            sharpen (bool, optional): Whether to apply sharpening and exposure adjustment. Defaults to True.
+            res_param (int, optional): 决定向 C++ Server 请求的图像分辨率参数。
+                                       有效值包括 480 (默认) 或 1080。Defaults to 480.
 
         Returns:
-            np.ndarray: The processed frame as a NumPy array (BGR format, 480x360).
+            np.ndarray: The processed frame as a NumPy array (BGR format)。
+                        图像尺寸取决于 Server 返回的实际分辨率。
         """
-        resp = self._send_command("tp 480")
+        if res_param not in [480, 720, 1080, 2160, -1]:
+            print(f"[get_frame_vlm] 警告: 请求了不支持的分辨率参数 '{res_param}'。将使用默认 480。")
+            res_param = 480
+            
+        command = f"tp {res_param}"
+        print(f"[get_frame_vlm] 正在请求分辨率参数为 {res_param} 的源图像...")
+
+        resp = self._send_command(command)
         if resp.get("status") != "ok" or resp.get("type") != "image":
             print("[get_frame_vlm] 错误: 未能从 M4D 获取图像。")
             return None
@@ -476,14 +558,87 @@ class DjiM4DDrone:
         try:
             np_arr = np.frombuffer(img_data, np.uint8)
             frame_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+            
             if frame_bgr is None:
                 print("[get_frame_vlm] 错误: cv2.imdecode 失败。")
                 return None
         except Exception as e:
             print(f"[get_frame_vlm] 图像解码时出错: {e}")
             return None
+            
+        # 关键修改：移除强制 resize
+        print(f"[get_frame_vlm] 成功获取 BGR 图像，实际尺寸: {frame_bgr.shape[1]}x{frame_bgr.shape[0]}")
         cv2.imwrite("current_frame_vlm.png", frame_bgr) 
         return frame_bgr
+    
+    def get_frame_vlm_fake(self, res_param: int = 480) -> np.ndarray:
+        """
+        [!! FAKE !!] 模拟 get_frame_vlm。
+        此函数不调用摄像头，而是按顺序循环返回 /home/dji/LMFly/UAV-Isaac-GR00T/uav_script/example_pic/ 目录中的图片。
+        
+        Get the current frame from the drone. (For VLM models)
+        此函数返回一个 BGR 图像。
+
+        Args:
+            res_param (int, optional): (此模拟函数中未使用) 决定向 C++ Server 请求的图像分辨率参数。
+                                       有效值包括 480 (默认) 或 1080。Defaults to 480.
+
+        Returns:
+            np.ndarray: The processed frame as a NumPy array (BGR format)。
+                        图像尺寸取决于读取的图片文件。
+        """
+        
+        # 1. 检查是否已初始化 (懒加载)
+        if not hasattr(self, 'fake_image_files'):
+            print("[get_frame_vlm_fake] 首次调用，正在初始化模拟图片列表...")
+            # --- Fake Image Loader for get_frame_vlm_fake ---
+            fake_image_dir = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/example_pic"
+            # 按照您提供的已知文件列表
+            file_names = ["ex1.png", "ex2.png", "ex0.png", "ex3.png", "ex4.png"]
+            self.fake_image_files = [os.path.join(fake_image_dir, f) for f in file_names]
+            self.fake_image_index = 0
+            
+            if not self.fake_image_files:
+                print(f"[get_frame_vlm_fake] 警告: 未能构建 'example_pic' 模拟图片列表。")
+            else:
+                print(f"[get_frame_vlm_fake] 'get_frame_vlm_fake' 已初始化, 将循环 {len(self.fake_image_files)} 张图片。")
+            # --- End Fake Image Loader ---
+
+        # 2. 检查是否有可用的模拟图片
+        if not self.fake_image_files:
+            print("[get_frame_vlm_fake] 错误: 模拟图片列表为空。请检查路径配置。")
+            return None
+
+        # 3. 获取当前要返回的图片路径
+        image_path = self.fake_image_files[self.fake_image_index]
+        
+        # 4. 更新索引，用于下一次调用 (循环)
+        self.fake_image_index = (self.fake_image_index + 1) % len(self.fake_image_files)
+
+        # 5. 读取图片
+        print(f"[get_frame_vlm_fake] 正在读取模拟图片: {image_path}")
+        try:
+            frame_bgr = cv2.imread(image_path)
+            
+            if frame_bgr is None:
+                print(f"[get_frame_vlm_fake] 错误: cv2.imread 无法读取 {image_path}")
+                # 尝试读取列表中的下一个，以防只有一个文件损坏
+                if len(self.fake_image_files) > 1:
+                     print("[get_frame_vlm_fake] 尝试读取下一个...")
+                     # 递归调用一次 (注意：如果所有文件都损坏，可能导致栈溢出，但对于4个文件的小列表是安全的)
+                     return self.get_frame_vlm_fake(res_param)
+                return None
+        
+        except Exception as e:
+            print(f"[get_frame_vlm_fake] 读取模拟图片时出错: {e}")
+            return None
+
+        # 6. 返回 BGR 图像 (不调整大小，模拟原函数的行为)
+        print(f"[get_frame_vlm_fake] 成功获取 BGR 模拟图像，实际尺寸: {frame_bgr.shape[1]}x{frame_bgr.shape[0]}")
+        # 模拟原函数保存调试图片
+        cv2.imwrite("current_frame_vlm.png", frame_bgr) 
+        return frame_bgr
+    # --- [!! 结束 !!] ---
 
     def _get_realtime_pose(self) -> dict:
         """
@@ -748,12 +903,12 @@ class DjiM4DDrone:
             temperature=0.01,
         )
         print(response.choices[0].message.content)
-        return response.choices[0].message.content
-
+        return response.choices[0].message.content # type: ignore
+    
     def objects_vlm(self, obj_name_list: list) -> list:
         """
         让大模型（视觉语言模型/VLM）检测当前无人机视角下的指定物体，并根据图像内容估算每个物体距离无人机的距离和角度。
-        本方法适用于仅有RGB相机，距离估算完全依赖大模型的视觉推理能力。坐标系遵循标准相机坐标系：X轴向右，Y轴向下，Z轴向前。
+        逻辑已更新：先获取 1080P 图像，将其按比例缩放（长边为 480P）供 VLM 使用，并从 1080P 图像上执行最终的 2D 裁剪。
 
         Args:
             obj_name_list (list): 需要检测和估算距离的物体名称列表。例如：["显示器", "蓝色球"]。
@@ -765,11 +920,36 @@ class DjiM4DDrone:
                 - y: 物体中心点在摄像头坐标系下的y轴距离（单位：米，float）
                 - z: 物体中心点在摄像头坐标系下的z轴距离（单位：米，float，通常为深度）
         """
-        bgr_image = self.get_frame_vlm()
-        if bgr_image is None:
+        # 1. 获取 1080P (或 Server 返回的最高分辨率) BGR 图像
+        bgr_image_full_res = self.get_frame_vlm(res_param=-1)
+        if bgr_image_full_res is None:
             print("objects_vlm 错误：未能获取 VLM 图像。")
             return []
-        base64_rgb_str = _cv2_to_base64(bgr_image, ".png")
+        
+        # 获取全分辨率图像尺寸
+        H_full, W_full = bgr_image_full_res.shape[:2]
+        print(f"[objects_vlm] 原始图像尺寸: {W_full}x{H_full}")
+        
+        # 2. 缩放图像至 VLM 尺寸，保持长宽比 (长边为 480)
+        MAX_VLM_SIDE = 480 
+        
+        if W_full >= H_full: # 横屏或正方形 (以宽度为基准)
+            W_vlm = MAX_VLM_SIDE
+            H_vlm = int(H_full * (MAX_VLM_SIDE / W_full))
+        else: # 竖屏 (以高度为基准)
+            H_vlm = MAX_VLM_SIDE
+            W_vlm = int(W_full * (MAX_VLM_SIDE / H_full))
+            
+        bgr_image_vlm = cv2.resize(bgr_image_full_res, (W_vlm, H_vlm))
+        print(f"[objects_vlm] VLM 使用图像尺寸 (按比例缩放): {W_vlm}x{H_vlm}")
+
+        # 比例因子：用于将 VLM 坐标映射回 1080P 坐标
+        scale_x = W_full / W_vlm
+        scale_y = H_full / H_vlm
+        
+        # 3. 准备 VLM 输入
+        base64_rgb_str = _cv2_to_base64(bgr_image_vlm, ".png") # 使用 VLM 缩放后的图像编码
+        
         obj_list_str = ", ".join(obj_name_list)
         prompt = f"""
         Detect all {obj_list_str} in the image.
@@ -793,6 +973,7 @@ class DjiM4DDrone:
         raw_response = response.choices[0].message.content
         print(f"Raw VLM response: {raw_response}")
         try:
+            # 4. 解析 VLM 响应
             try:
                 result = json.loads(raw_response)
             except json.JSONDecodeError:
@@ -804,40 +985,103 @@ class DjiM4DDrone:
                 else:
                     result = []
             
-            annotated_img = bgr_image.copy(); save_annotated = False
+            # 使用 VLM 图像进行标注（current_frame_xyz.png）
+            annotated_img = bgr_image_vlm.copy(); save_annotated = False 
+            
+            # VLM 图像的尺寸 (h, w 用于 3D 投影计算)
+            h, w = H_vlm, W_vlm 
+            f = 500.0; cx, cy = w / 2, h / 2
+            category_colors = {}; colors = [(255, 0, 0),(0, 255, 0),(0, 0, 255),(255, 255, 0),(255, 0, 255),(0, 255, 255),]
+            
+            processed = []
             if result and isinstance(result, list) and len(result) > 0:
-                save_annotated = True; h, w = annotated_img.shape[:2]; f = 500.0; cx, cy = w / 2, h / 2
-                category_colors = {}; colors = [(255, 0, 0),(0, 255, 0),(0, 0, 255),(255, 255, 0),(255, 0, 255),(0, 255, 255),]
-                for obj in result:
+                save_annotated = True
+                
+                for obj_id, obj in enumerate(result):
                     bbox = obj.get("bbox_3d", []); label = obj.get("label", "unknown")
                     if len(bbox) < 9: continue
                     x_c, y_c, z_c = bbox[0], bbox[1], bbox[2]; dx, dy, dz = bbox[3], bbox[4], bbox[5]; roll, pitch, yaw = bbox[6], bbox[7], bbox[8]
+                    
+                    # 1. 3D 边界框计算和绘制 (基于 VLM 图像的投影)
                     if label not in category_colors: category_colors[label] = colors[len(category_colors) % len(colors)]
                     color = category_colors[label]
                     corners_local = np.array([[dx/2,dy/2,dz/2],[dx/2,dy/2,-dz/2],[dx/2,-dy/2,dz/2],[dx/2,-dy/2,-dz/2],[-dx/2,dy/2,dz/2],[-dx/2,dy/2,-dz/2],[-dx/2,-dy/2,dz/2],[-dx/2,-dy/2,-dz/2],])
                     R_x = np.array([[1,0,0],[0,np.cos(roll),-np.sin(roll)],[0,np.sin(roll),np.cos(roll)]]); R_y = np.array([[np.cos(pitch),0,np.sin(pitch)],[0,1,0],[-np.sin(pitch),0,np.cos(pitch)]]); R_z = np.array([[np.cos(yaw),-np.sin(yaw),0],[np.sin(yaw),np.cos(yaw),0],[0,0,1]]); R = R_z @ R_y @ R_x
                     corners_3d = (R @ corners_local.T).T + np.array([x_c, y_c, z_c]); corners_2d = []
+                    
+                    # 2. 投影到 VLM 图像
+                    min_u, max_u, min_v, max_v = w, 0, h, 0
+                    valid_projection = False
                     for corner in corners_3d:
                         if corner[2] <= 0: corners_2d.append(None); continue
                         u = int(f * corner[0] / corner[2] + cx); v = int(f * corner[1] / corner[2] + cy); corners_2d.append((u, v))
+                        min_u = min(min_u, u); max_u = max(max_u, u)
+                        min_v = min(min_v, v); max_v = max(max_v, v)
+                        valid_projection = True
+
+                    # 3. 绘制 3D 边界框 (在 VLM 图像上)
                     lines = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)]
                     for i, j in lines:
                         if corners_2d[i] and corners_2d[j]: cv2.line(annotated_img, corners_2d[i], corners_2d[j], color, 2)
+                    
+                    # 4. 绘制标签和中心点
                     valid_corners = [c for c in corners_2d if c is not None]
-                    if valid_corners: centroid = np.mean(valid_corners, axis=0).astype(int); cv2.putText(annotated_img, label, (centroid[0], centroid[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            if save_annotated: cv2.imwrite("current_frame_xyz.png", annotated_img); print(f"Saved 3D bounding box visualization: current_frame_xyz.png")
+                    if valid_corners: 
+                        centroid = np.mean(valid_corners, axis=0).astype(int)
+                        cv2.putText(annotated_img, label, (centroid[0], centroid[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    # 5. 裁剪和保存 2D 图像 (从 1080P 图像上裁剪)
+                    if valid_projection:
+                        # 扩展区域（VLM 图像上的 PADDING）
+                        PADDING = 3
+                        
+                        # 1) 计算 VLM 图像上的裁剪区域
+                        crop_x_min_vlm = max(0, min_u - PADDING)
+                        crop_y_min_vlm = max(0, min_v - PADDING)
+                        crop_x_max_vlm = min(w, max_u + PADDING)
+                        crop_y_max_vlm = min(h, max_v + PADDING)
+
+                        # 2) 将 VLM 坐标按比例映射回 1080P 坐标
+                        # 使用 int() 进行向下取整，确保像素索引有效
+                        crop_x_min_full = int(crop_x_min_vlm * scale_x)
+                        crop_y_min_full = int(crop_y_min_vlm * scale_y)
+                        crop_x_max_full = int(crop_x_max_vlm * scale_x)
+                        crop_y_max_full = int(crop_y_max_vlm * scale_y)
+                        
+                        # 3) 确保 1080P 裁剪区域在图像边界内
+                        crop_x_min_full = max(0, crop_x_min_full)
+                        crop_y_min_full = max(0, crop_y_min_full)
+                        crop_x_max_full = min(W_full, crop_x_max_full)
+                        crop_y_max_full = min(H_full, crop_y_max_full)
+                        
+                        # 4) 裁剪 1080P 图像
+                        cropped_img = bgr_image_full_res[crop_y_min_full:crop_y_max_full, crop_x_min_full:crop_x_max_full]
+                        
+                        # 5) 保存文件
+                        safe_label = label.replace(" ", "_")
+                        crop_file_path = f"current_frame_vlm_{safe_label}_{obj_id}.png"
+                        cv2.imwrite(crop_file_path, cropped_img)
+                        print(f"Saved 2D crop from 1080P: {crop_file_path}")
+                        
+                    # 6. 处理结果列表
+                    if len(bbox) >= 3:
+                        processed.append({ 
+                            "name": label, 
+                            "x": round(float(bbox[0]), 3), 
+                            "y": round(float(bbox[1]), 3), 
+                            "z": round(float(bbox[2]), 3), 
+                        })
+
+            # 7. 保存带 3D 框的完整图像 (VLM 缩放分辨率)
+            if save_annotated: 
+                cv2.imwrite("current_frame_xyz.png", annotated_img)
+                print(f"Saved 3D bounding box visualization (VLM scale): current_frame_xyz.png")
             
-            processed = []
-            for obj in result:
-                bbox = obj.get("bbox_3d", []); label = obj.get("label", "unknown")
-                if len(bbox) >= 3:
-                    processed.append({ "name": label, "x": round(float(bbox[0]), 3), "y": round(float(bbox[1]), 3), "z": round(float(bbox[2]), 3), })
             return processed
         except Exception as e:
             print(f"解析VLM响应时出错: {e}")
             return []
-
-    # [!! FIXED !!]
+        
     def scan(self, obj_name_list: list) -> list:
         """
         让无人机原地旋转一圈以扫描周围环境，检测指定物体。
@@ -939,9 +1183,11 @@ class DjiM4DDrone:
                 print(f"目标在上方，需上升 {abs(move_z_cm)} cm。"); self.move_up(abs(move_z_cm)); actions_taken.append(f"上升 {abs(move_z_cm)} cm")
         current_distance_cm = int(z_m * 100); move_distance_cm = current_distance_cm - target_distance_cm
         if move_distance_cm > 20: 
-            print(f"正在前进 {move_distance_cm} cm。"); self.move_forward(min(move_distance_cm, 500)); actions_taken.append(f"前进 {move_distance_cm} cm")
+            print(f"正在前进 {move_distance_cm} cm。")
+            self.move_forward(min(move_distance_cm, 5000))
+            actions_taken.append(f"前进 {move_distance_cm} cm")
         elif move_distance_cm < -20:
-            print(f"正在后退 {abs(move_distance_cm)} cm。"); self.move_backward(min(abs(move_distance_cm), 500)); actions_taken.append(f"后退 {abs(move_distance_cm)} cm")
+            print(f"正在后退 {abs(move_distance_cm)} cm。"); self.move_backward(min(abs(move_distance_cm), 5000)); actions_taken.append(f"后退 {abs(move_distance_cm)} cm")
         if not actions_taken:
             print("物体已经在目标位置，无需移动。"); return False
         else:
@@ -1241,114 +1487,275 @@ class DjiM4DDrone:
         else:
             print(f"[fly_dynamic_kmz_mission_gps] 错误: C++ Server 报告执行失败: {resp.get('message')}")
             return False
-        
-    def face_compare(self, local:bool = False) -> bool:
+    
+    def face_compare(self, local: bool = False, target_image_path: str = None, use_api: bool = False, detection_method: str = "vlm") -> bool:
         """
-        人脸比较。立刻 get_frame 获得一张图片和 /home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg 这张人图片对比相似度，
-        大于50% (即 similarity > 0.5) 就判定是一个人，返回 True。
+        统一的人脸比较函数。
+        1. 获取当前图像。
+        2. 检测并裁剪人脸 (支持 VLM 或 YOLO)。
+        3. 进行特征比对 (支持 本地ONNX 或 百度API)。
+
+        Args:
+            local (bool): 调试模式，使用本地固定图片。
+            target_image_path (str): 指定图片路径。
+            use_api (bool): True=百度API, False=本地ONNX。
+            detection_method (str): "vlm" (原有逻辑) 或 "yolo" (使用 ultralytics)。
 
         Returns:
-            bool: 如果是同一个人 (相似度 > 50%) 返回 True, 否则返回 False。
+            bool: 是否匹配成功。
         """
-        if LVFaceONNXInferencer is None:
-            print("[face_compare] 错误: 'lvface_inferencer' 库未成功导入。")
-            self.talk("人脸识别库未安装，无法比较")
-            return False
-
+        # --- 0. 基础配置 ---
         reference_image_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg"
-        model_file = "/open_app/models/LVFace/LVFace-B_Glint360K.onnx" 
+        temp_original_path = ""
 
-        # 1. 初始化推理器
-        try:
-            inferencer = LVFaceONNXInferencer(
-                model_path=model_file,  # Path to your ONNX model
-                use_gpu=True            # 假设环境支持 GPU
-            )
-        except Exception as e:
-            print(f"[face_compare] 错误: 初始化 LVFaceONNXInferencer 失败: {e}")
-            self.talk("人脸识别模块初始化失败")
-            return False
-
-        if not local:
-            temp_current_frame_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_drone_face.jpg"
-            # 2. 获取无人机当前帧并保存
-            print("[face_compare] 正在从无人机获取当前帧 (使用 get_frame)...")
-            # get_frame() 返回 480x360 RGB numpy 数组
-            current_frame_rgb = self.get_frame_vlm() 
-            
-            if current_frame_rgb is None:
-                print("[face_compare] 错误: 从 get_frame() 未能获取图像。")
-                self.talk("获取当前图像失败")
-                return False
-
-            # 将 RGB 帧转换为 BGR (LVFace 可能期望 BGR，但更重要的是保存)
-            # current_frame_bgr = cv2.cvtColor(current_frame_rgb, cv2.COLOR_RGB2BGR)
-            try:
-                cv2.imwrite(temp_current_frame_path, current_frame_rgb)
-            except Exception as e:
-                print(f"[face_compare] 错误: 保存当前帧到临时文件失败: {e}")
-                self.talk("保存临时图像失败")
-                return False
+        # --- 1. 获取/确定原始图像 ---
+        if target_image_path:
+            temp_original_path = target_image_path
+            print(f"[face_compare] 使用外部图片: {temp_original_path}")
+        elif local:
+            temp_original_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_frame_vlm.png"
+            print(f"[face_compare] 使用本地调试图片: {temp_original_path}")
         else:
-            temp_current_frame_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_frame_vlm.png"
-
-            
-        # 3. 提取特征
-        try:
-            # 提取参考图片特征
-            if not os.path.exists(reference_image_path):
-                print(f"[face_compare] 错误: 参考图片未找到: {reference_image_path}")
-                self.talk("未找到参考照片")
+            temp_original_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/current_drone_face_original.jpg"
+            # print("[face_compare] 正在获取当前帧...")
+            current_frame_bgr = self.get_frame_vlm()
+            if current_frame_bgr is None:
+                self.talk("获取图像失败")
                 return False
-                
-            print("[face_compare] 正在提取参考图片特征...")
-            feat_ref = inferencer.infer_from_image(reference_image_path)
-            if feat_ref is None:
-                 print("[face_compare] 错误: 无法从参考图片中提取人脸特征。")
-                 self.talk("无法从参考照片中提取人脸")
-                 return False
+            cv2.imwrite(temp_original_path, current_frame_bgr)
 
-            # 提取当前帧特征
-            print("[face_compare] 正在提取当前帧特征...")
-            feat_current = inferencer.infer_from_image(temp_current_frame_path)
-            if feat_current is None:
-                 print("[face_compare] 警告: 无法从当前帧中提取人脸特征。")
-                 self.talk("当前画面中未发现人脸")
-                 return False
-
-            # 4. 计算相似度
-            similarity = inferencer.calculate_similarity(feat_ref, feat_current)
-            
-            print(f"[face_compare] 相似度分数: {similarity:.6f}")
-
-            # 5. 判断
-            similarity_threshold = 0.5
-            if similarity > similarity_threshold:
-                self.talk(f"[face_compare] ==========================   匹配成功，相似度 {similarity*100:.2f}% 大于{similarity_threshold*100}%")
-                return True
-            else:
-                self.talk(f"[face_compare] ==========================   未找到匹配的人，相似度 {similarity*100:.2f}% 不足{similarity_threshold*100}%")
-                return False
-
-        except Exception as e:
-            print(f"[face_compare] 人脸识别过程中发生错误: {e}")
-            self.talk("人脸识别过程中发生错误")
+        temp_cropped_face_path = temp_original_path.replace(".png", "_face.png").replace(".jpg", "_face.jpg")
+        original_bgr = cv2.imread(temp_original_path)
+        if original_bgr is None:
+            print(f"[face_compare] 无法读取图片: {temp_original_path}")
             return False
+        
+        H, W = original_bgr.shape[:2]
+        
+        # ==========================================
+        # 分支 1: 使用 YOLO 进行人脸检测与裁剪
+        # ==========================================
+        if detection_method == "yolo":
+            try:
+                from ultralytics import YOLO
+                
+                # 懒加载模型
+                if self.yolo_model is None:
+                    print(f"[face_compare] 首次加载 YOLO 模型: {self.yolo_model_path} ...")
+                    self.yolo_model = YOLO(self.yolo_model_path).to("cuda") 
+                
+                # 推理
+                # print("[face_compare] 正在运行 YOLO 检测...")
+                results = self.yolo_model.predict(source=original_bgr, conf=0.25, max_det=100, verbose=False)
+                
+                best_face_crop = None
+                max_area = 0
+                scale = 1.2 # 放大系数
+                
+                # 寻找最大的人脸 (Most prominent)
+                for result in results:
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    for box in boxes:
+                        x1, y1, x2, y2 = map(int, box)
+                        area = (x2 - x1) * (y2 - y1)
+                        
+                        if area > max_area:
+                            max_area = area
+                            # 计算中心和宽高 (应用 scale)
+                            cx = (x1 + x2) / 2
+                            cy = (y1 + y2) / 2
+                            w = (x2 - x1) * scale
+                            h = (y2 - y1) * scale
+                            
+                            new_x1 = max(int(cx - w/2), 0)
+                            new_y1 = max(int(cy - h/2), 0)
+                            new_x2 = min(int(cx + w/2), W)
+                            new_y2 = min(int(cy + h/2), H)
+                            
+                            best_face_crop = original_bgr[new_y1:new_y2, new_x1:new_x2]
 
+                if best_face_crop is not None and best_face_crop.size > 0:
+                    cv2.imwrite(temp_cropped_face_path, best_face_crop)
+                    cH, cW = best_face_crop.shape[:2]
+                    print(f"[face_compare] YOLO 裁剪完成: {cW}x{cH}")
+                else:
+                    print("[face_compare] YOLO 未检测到人脸。")
+                    self.talk("未检测到人脸")
+                    return False
+
+            except ImportError:
+                print("[face_compare] 错误: 未安装 ultralytics 库。")
+                return False
+            except Exception as e:
+                print(f"[face_compare] YOLO 检测出错: {e}")
+                return False
+
+        # ==========================================
+        # 分支 2: 使用 VLM 进行人脸检测与裁剪 (原有逻辑)
+        # ==========================================
+        else: 
+            # print("[face_compare] 正在调用 VLM 检测人脸...")
+            try:
+                base64_rgb_str = _cv2_to_base64(original_bgr, ".png")
+                prompt = f"""
+                Detect the **most prominent face** in the image.
+                - If faces found, output JSON: {{"bbox_2d": [x_min, y_min, x_max, y_max]}} (normalized 0-1000).
+                - If no face, output: {{}}
+                """
+                response = self.llm_client.chat.completions.create(
+                    model=API_VL_MODEL,
+                    messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_rgb_str}"}}]}],
+                    temperature=0.01,
+                )
+                raw_response = response.choices[0].message.content
+                
+                try:
+                    vlm_result = json.loads(raw_response.strip())
+                except:
+                    start = raw_response.find("{"); end = raw_response.rfind("}")
+                    vlm_result = json.loads(raw_response[start:end+1]) if start != -1 else {}
+
+                bbox = vlm_result.get("bbox_2d")
+                if not bbox or len(bbox) != 4:
+                    print("[face_compare] VLM 未检测到人脸。")
+                    self.talk("未检测到清晰人脸")
+                    return False
+
+                x1_n, y1_n, x2_n, y2_n = bbox
+                # 坐标转换 + Padding (原有 VLM 逻辑的 10% padding)
+                x1 = int(x1_n * W / 1000.0); y1 = int(y1_n * H / 1000.0)
+                x2 = int(x2_n * W / 1000.0); y2 = int(y2_n * H / 1000.0)
+                
+                pad_x = int((x2 - x1) * 0.1)
+                pad_y = int((y2 - y1) * 0.1)
+                
+                cx1 = max(0, x1 - pad_x); cy1 = max(0, y1 - pad_y)
+                cx2 = min(W, x2 + pad_x); cy2 = min(H, y2 + pad_y)
+                
+                cropped_img = original_bgr[cy1:cy2, cx1:cx2]
+                if cropped_img.size == 0: return False
+                cv2.imwrite(temp_cropped_face_path, cropped_img)
+                print(f"[face_compare] VLM 裁剪完成。")
+
+            except Exception as e:
+                print(f"[face_compare] VLM 处理出错: {e}")
+                return False
+
+        # ==========================================
+        # 3. 开始比对 (API 或 Local) - 公共部分
+        # ==========================================
+        if use_api:
+            # --- 百度 API ---
+            # print("[face_compare] 正在使用百度 API 比对...")
+            try:
+                from aip import AipFace
+                
+                client = AipFace(_API_APP_ID, _API_KEY, _SECRET_KEY) # 建议提取为常量
+                
+                with open(reference_image_path, 'rb') as f: ref_b64 = base64.b64encode(f.read()).decode()
+                with open(temp_cropped_face_path, 'rb') as f: cur_b64 = base64.b64encode(f.read()).decode()
+                
+                images = [
+                    {'image': ref_b64, 'image_type': 'BASE64', 'face_type': 'LIVE', 'quality_control': 'LOW'},
+                    {'image': cur_b64, 'image_type': 'BASE64', 'face_type': 'LIVE', 'quality_control': 'LOW'}
+                ]
+                res = client.match(images)
+                
+                if res.get('error_code') == 0:
+                    score = res['result']['score']
+                    print(f"[face_compare] API 相似度: {score:.2f}")
+                    if score > 50.0:
+                        self.talk(f"匹配成功，相似度 {score:.1f}")
+                        return True
+                else:
+                    if res.get('error_msg') == "face is fuzzy":
+                        pass ## 应该怎么办呢？
+                    print(f"[face_compare] API 错误: {res.get('error_msg')}")
+                    
+            except Exception as e:
+                print(f"[face_compare] API 出错: {e}")
+
+        else:
+            # --- 本地 ONNX ---
+            try:
+                feat_ref = self.inferencer.infer_from_image(reference_image_path)
+                feat_cur = self.inferencer.infer_from_image(temp_cropped_face_path)
+                
+                if feat_ref is not None and feat_cur is not None:
+                    sim = self.inferencer.calculate_similarity(feat_ref, feat_cur)
+                    print(f"[face_compare] 本地相似度: {sim:.4f}")
+                    if sim > 0.5:
+                        self.talk(f"匹配成功，相似度 {sim*100:.1f}")
+                        return True
+            except Exception as e:
+                print(f"[face_compare] 本地比对出错: {e}")
+
+        return False
+    
+
+    def check_current_view(self) -> dict:
+        """(内部函数) 检查当前单一视图"""
+        print("[scan_for_person] 正在检查当前视图 (VLM find person + face_compare verify)...")
+        
+        # 查找并删除所有名为 'current_frame_vlm_person_*.png' 的文件
+        # for old_crop_file in glob.glob("current_frame_vlm_person_*.png"):
+        #     try:
+        #         os.remove(old_crop_file)
+        #         # print(f"已删除旧裁剪文件: {old_crop_file}") # 调试信息
+        #     except OSError as e:
+        #         print(f"警告: 删除文件 {old_crop_file} 失败: {e}")
+
+
+        # 1. VLM 检测所有人 (objects_vlm 会自动获取 1080P 图像，并缩放 480P 供 VLM 使用)
+        #    objects_vlm 会生成并保存裁剪图文件 current_frame_vlm_person_{ID}.png
+        all_persons = self.objects_vlm(["person"]) 
+        
+        if not all_persons:
+            print("[scan_for_person] VLM 未检测到 'person'。")
+            return None
+            
+        print(f"[scan_for_person] VLM 找到 {len(all_persons)} 个 'person'。正在迭代调用 face_compare 验证...")
+
+        # 2. 遍历 VLM 找到的所有 'person'
+        for obj_id, person_data in enumerate(all_persons):
+            # objects_vlm 裁剪图的文件命名规则
+            crop_file_path = f"current_frame_vlm_person_{obj_id}.png"
+            
+            # 3. 调用修改后的 face_compare 进行验证，传入裁剪图路径
+            try:
+                # is_person_A = self.face_compare(local=True, target_image_path=crop_file_path)
+                is_person_A = self.face_compare(local=True, target_image_path=crop_file_path, use_api=True, detection_method="yolo")
+            except Exception as e:
+                print(f"[scan_for_person] face_compare() 执行时出错: {e}")
+                continue # 继续检查下一个 person
+            
+            # 4. 检查验证结果
+            if is_person_A:
+                print(f"[scan_for_person] face_compare 验证成功! VLM ID {obj_id} 匹配 person_A。")
+                
+                x_m = person_data.get("x", 0)
+                y_m = person_data.get("y", 0)
+                z_m = person_data.get("z", 0)
+
+                if z_m <= 0:
+                        print(f"[scan_for_person] face_compare 成功, 但 VLM 返回无效 Z 距离 ({z_m})。")
+                        return None
+                
+                return {"x": x_m, "y": y_m, "z": z_m}
+            else:
+                print(f"[scan_for_person] VLM ID {obj_id} 验证失败。")
+        
+        # 5. 所有 VLM 找到的人都未通过人脸识别
+        print("[scan_for_person] 当前视图中所有找到的 'person' 都不是 person_A。")
+        return None
         
     def scan_for_person(self) -> dict:
         """
-        [!! 已按新逻辑修改 !!]
         实现 "VLM检测person + 独立face_compare验证" 逻辑来寻找 person_A。
         在每个角度：
-        1. 调用 objects_vlm(["person"]) 获取所有人的 3D 框。
-        2. 如果 VLM 找到了至少一个 "person"：
-        3.    **立即**调用 *原始* face_compare() (它会自己抓取一帧) 来验证当前画面中是否有 person_A。
-        4.    如果 face_compare() 返回 True (匹配成功):
-        5.       我们假设 VLM 找到的第一个 "person" 就是 person_A。
-        6.       返回这个 "person" 的 3D 坐标。
-        7. 如果 VLM 没找到 "person" 或 face_compare() 返回 False:
-        8.    旋转 45 度并重复。
+        1. 调用 objects_vlm(["person"]) 获取所有人的 3D 框，并生成裁剪图。
+        2. 遍历 VLM 找到的每个 "person" 的裁剪图，调用 face_compare() 进行验证。
+        3. 如果 face_compare() 返回 True (匹配成功)，则返回该 person 的 3D 坐标。
         
         如果 360 度扫描（包括平移）后未找到，返回 None。
 
@@ -1357,81 +1764,40 @@ class DjiM4DDrone:
                   如果未找到则返回 None。
         """
         
-        def check_current_view() -> dict:
-            """(内部函数) 检查当前单一视图"""
-            print("[scan_for_person] 正在检查当前视图 (VLM find person + face_compare verify)...")
-            
-            # 1. VLM 检测所有人
-            #    (让它自己抓取帧, 传入 frame_to_check=None)
-            all_persons = self.objects_vlm(["person"]) 
-            
-            if not all_persons:
-                print("[scan_for_person] VLM 未检测到 'person'。")
-                return None
-                
-            print(f"[scan_for_person] VLM 找到 {len(all_persons)} 个 'person'。正在调用 face_compare 验证...")
-
-            # 2. 调用 *原始* face_compare 进行独立验证
-            #    (这个函数会自己调用 get_frame_vlm())
-            try:
-                is_person_A = self.face_compare(True) 
-            except Exception as e:
-                print(f"[scan_for_person] face_compare() 执行时出错: {e}")
-                return None
-
-            # 3. 检查验证结果
-            if is_person_A:
-                print(f"[scan_for_person] face_compare 验证成功! 找到 person_A。")
-                
-                # 4. 假设 VLM 找到的第一个人就是 person_A, 返回其 3D 坐标
-                person_data = all_persons[0] # 逻辑假设：VLM 找到的第一个人就是目标
-                
-                x_m = person_data.get("x", 0)
-                y_m = person_data.get("y", 0)
-                z_m = person_data.get("z", 0)
-
-                if z_m <= 0:
-                     print(f"[scan_for_person] face_compare 成功, 但 VLM 返回无效 Z 距离 ({z_m})。")
-                     return None
-                
-                return {"x": x_m, "y": y_m, "z": z_m}
-            else:
-                # face_compare 已经 self.talk("未找到匹配的人...")
-                print(f"[scan_for_person] face_compare 验证失败 (未匹配)。")
-                return None
         
-        # --- scan_for_person 主循环 (保持不变) ---
+        
+        # --- scan_for_person 主循环 (原地、左侧、右侧扫描，代码保持不变) ---
 
-        # (M4D) 原地360度扫描
-        for i in range(8):
-            result_3d = check_current_view()
+        # (M4D) 原地360度扫描 (每次旋转 90 度，总共 4 次)
+        for i in range(6):
+            result_3d = self.check_current_view()
             if result_3d:
-                print(f"[scan_for_person] 在第 {i+1} 次尝试 (旋转 {i*45} 度) 时找到 person_A。")
+                print(f"[scan_for_person] 在第 {i+1} 次尝试 (旋转 {i*60} 度) 时找到 person_A。")
                 return result_3d
-            print(f"[scan_for_person] 第 {i+1}/8 次尝试 (原地) 未找到 person_A，逆时针旋转 45 度...")
-            self.turn_counter_clockwise(45)
+            print(f"[scan_for_person] 第 {i+1}/6 次尝试 (原地) 未找到 person_A，逆时针旋转 90 度...")
+            self.turn_counter_clockwise(60) # 修正旋转 90 度
 
         # (M4D) 向左 1.5m, 扫描360度
         print("[scan_for_person] 原地扫描失败。向左移动 150cm...")
         self.move_left(150) 
-        for i in range(8):
-            result_3d = check_current_view()
+        for i in range(6):
+            result_3d = self.check_current_view()
             if result_3d:
                 print(f"[scan_for_person] 在左侧 {i+1} 次尝试时找到 person_A。")
                 return result_3d
-            print(f"[scan_for_person] 第 {i+1}/8 次尝试 (左侧) 未找到 person_A，逆时针旋转 45 度...")
-            self.turn_counter_clockwise(45)
+            print(f"[scan_for_person] 第 {i+1}/6 次尝试 (左侧) 未找到 person_A，逆时针旋转 90 度...")
+            self.turn_counter_clockwise(60) # 修正旋转 90 度
 
         # (M4D) 向右 3m, 扫描360度
         print("[scan_for_person] 左侧扫描失败。向右移动 300cm (穿过原点)...")
         self.move_right(300) 
-        for i in range(8):
-            result_3d = check_current_view()
+        for i in range(6):
+            result_3d = self.check_current_view()
             if result_3d:
                 print(f"[scan_for_person] 在右侧 {i+1} 次尝试时找到 person_A。")
                 return result_3d
-            print(f"[scan_for_person] 第 {i+1}/8 次尝试 (右侧) 未找到 person_A，逆时针旋转 45 度...")
-            self.turn_counter_clockwise(45)
+            print(f"[scan_for_person] 第 {i+1}/6 次尝试 (右侧) 未找到 person_A，逆时针旋转 90 度...")
+            self.turn_counter_clockwise(60) # 修正旋转 90 度
 
         # (M4D) 回到原点
         print("[scan_for_person] 右侧扫描失败。返回起始水平位置...")
@@ -1516,17 +1882,645 @@ class DjiM4DDrone:
             print("完成 move_to_person 操作，动作包括: " + ", ".join(actions_taken))
             self.talk("已移动到目标人物面前")
             return True
-       
-    def shutdown(self):
+        
+
+    ###################################
+    ###################################
+    ###################################
+    ###################################
+
+    def _load_depth_model(self):
         """
-        关闭与 C++ PSDKServer 的持久连接。
+        (内部辅助) 懒加载 DepthAnythingV2 模型。
         """
-        print("DjiM4DDrone wrapper shutting down...")
-        with self.command_lock:
-            if self.socket:
+        if self.depth_model is not None:
+            return True
+            
+        if DepthAnythingV2 is None:
+            print("[_load_depth_model] 错误: DepthAnythingV2 库未导入。")
+            return False
+
+        print("[_load_depth_model] 正在首次加载 DepthAnythingV2 (vits, vkitti)...")
+        try:
+            # --- 参数 (来自 main_depth_test2.py) ---
+            encoder = 'vits' 
+            dataset = 'vkitti' 
+            max_depth = 20 
+            load_from = f'/open_app/models/depth_anything_v2/depth_anything_v2_metric_{dataset}_{encoder}.pth'
+            
+            if not os.path.exists(load_from):
+                print(f"错误：找不到深度模型权重文件 {load_from}")
+                return False
+                
+            self.depth_model = DepthAnythingV2(**{**model_configs[encoder], 'max_depth': max_depth})
+            self.depth_model.load_state_dict(torch.load(load_from, map_location='cpu'))
+            self.depth_model = self.depth_model.to(self.depth_device).eval()
+            print("[_load_depth_model] 深度模型加载成功。")
+            return True
+        except Exception as e:
+            print(f"[_load_depth_model] 深度模型加载失败: {e}")
+            self.depth_model = None
+            return False
+
+    def _get_xyz_from_depth_model(self, image_bgr, target_yolo_box):
+        """
+        (内部辅助) 使用 DepthAnythingV2 和针孔相机模型计算 XYZ。
+        [!! 更新 !!] 
+        - 图像在送入模型前，高度 > 720p 会被按比例缩小。
+        - YOLO box 坐标会相应缩放。
+        - 所有后续计算 (采样, 投影, 可视化) 均在缩放后的 720p 空间中进行。
+        """
+        # 1. 确保模型已加载
+        if self.depth_model is None:
+            if not self._load_depth_model():
+                print("[_get_xyz_from_depth_model] 错误: 深度模型无法加载。")
+                return None
+        
+        # --- [新增] 2. 图像预处理: 如果高度 > 720p, 则按比例缩小 ---
+        MAX_HEIGHT = 720.0
+        H_orig, W_orig = image_bgr.shape[:2]
+        
+        scale_factor = 1.0
+        processed_bgr = image_bgr
+        processed_yolo_box = target_yolo_box
+        
+        if H_orig > MAX_HEIGHT:
+            # print(f"[_get_xyz_from_depth_model] 图像高度 {H_orig}p > {int(MAX_HEIGHT)}p, 正在缩放...")
+            scale_factor = MAX_HEIGHT / H_orig
+            W_new = int(W_orig * scale_factor)
+            H_new = int(MAX_HEIGHT) # 720
+            
+            # 使用 INTER_AREA (区域插值) 进行缩小，效果最好
+            processed_bgr = cv2.resize(image_bgr, (W_new, H_new), interpolation=cv2.INTER_AREA)
+            
+            # 按比例缩放 YOLO 框坐标
+            processed_yolo_box = [int(coord * scale_factor) for coord in target_yolo_box]
+            # print(f"[_get_xyz_from_depth_model] 缩放后尺寸: {W_new}x{H_new} (Scale: {scale_factor:.4f})")
+        # else:
+        #     print(f"[_get_xyz_from_depth_model] 图像高度 {H_orig}p, 无需缩放。")
+        # -----------------------------------------------------------
+        
+        # 3. 获取深度图 (在 'processed_bgr' 上运行)
+        print("[_get_xyz_from_depth_model] 正在推断深度图...")
+        start_time = time.time()
+        try:
+            # [!! 修改 !!] 使用 processed_bgr
+            depth_map_proc = self.depth_model.infer_image(processed_bgr, input_size=518)
+        except Exception as e:
+            print(f"[_get_xyz_from_depth_model] 深度模型推断失败: {e}")
+            return None
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"[Depth Model] 执行时间: {elapsed_time:.6f} 秒")
+
+        
+        # 4. 获取 YOLO 框中心点 (在 'processed_bgr' 空间中)
+        # [!! 修改 !!] 使用 processed 变量
+        H_proc, W_proc = processed_bgr.shape[:2]
+        x1, y1, x2, y2 = processed_yolo_box
+        yolo_u = int((x1 + x2) / 2)
+        yolo_v = int((y1 + y2) / 2)
+        
+        # 5. 从深度图中获取 Z (米)
+        Z_m = 0.0
+        try:
+            # [!! 修改 !!] 使用 depth_map_proc
+            Z_m = float(depth_map_proc[yolo_v, yolo_u])
+        except IndexError:
+            print(f"[_get_xyz_from_depth_model] 错误: 坐标 ({yolo_v}, {yolo_u}) 超出深度图边界 ({depth_map_proc.shape})")
+            Z_m = -1.0 # 设为无效值
+
+        # --- 6. 生成可视化深度图 (逻辑来自 main_depth_test2.py) ---
+        VIS_MIN = 0.0
+        # [!! 修正 !!] 确保 VIS_MAX 与 _load_depth_model 中的 max_depth (20.0) 一致
+        VIS_MAX = 20.0 
+        
+        # [!! 修改 !!] 使用 depth_map_proc
+        depth_clipped = np.clip(depth_map_proc, VIS_MIN, VIS_MAX) 
+        
+        if VIS_MAX - VIS_MIN > 1e-6:
+            depth_normalized = (depth_clipped - VIS_MIN) / (VIS_MAX - VIS_MIN)
+        else:
+            depth_normalized = np.zeros_like(depth_clipped)
+            
+        depth_uint8 = (depth_normalized * 255).astype(np.uint8)
+        
+        depth_vis = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+
+        # --- 7. 标注并保存图像 (在 'processed_bgr' 空间中) ---
+        try:
+            # [!! 无需修改 !!] x1,y1,x2,y2, yolo_u,v, Z_m 已经都是 processed 空间的值
+            cv2.rectangle(depth_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.circle(depth_vis, (yolo_u, yolo_v), 5, (0, 0, 255), -1)
+            
+            text = f"Z: {Z_m:.2f}m"
+            text_pos = (x1, y1 - 10 if y1 > 10 else y1 + 20)
+            cv2.putText(depth_vis, text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            
+            save_path = "temp_current_frame_depth_annotated.png"
+            cv2.imwrite(save_path, depth_vis)
+            print(f"[_get_xyz_from_depth_model] 带标注的深度图已保存: {save_path}")
+
+        except Exception as e:
+            print(f"[_get_xyz_from_depth_model] 标注深度图时出错: {e}")
+
+        # 8. 检查 Z 有效性
+        if Z_m <= 0.1: # 最小有效距离
+            print(f"[_get_xyz_from_depth_model] 深度值无效 (Z={Z_m:.2f}m)，无法计算XYZ。")
+            return None
+            
+        # 9. 计算 X 和 Y (反向投影) - [!! 修改 !!]
+        #    现在所有计算都基于 'processed_bgr' (H_proc, W_proc) 的维度
+        
+        MAX_VLM_SIDE = 480 # VLM 基准 (f=500)
+        
+        # [!! 修改 !!] 使用 H_proc, W_proc
+        if W_proc >= H_proc:
+            W_vlm = MAX_VLM_SIDE
+            H_vlm = int(H_proc * (MAX_VLM_SIDE / W_proc))
+        else:
+            H_vlm = MAX_VLM_SIDE
+            W_vlm = int(W_proc * (MAX_VLM_SIDE / H_proc))
+        
+        # [!! 修改 !!] 计算 'processed' 空间下的焦距和中心点
+        f_proc_x = 500.0 * (W_proc / W_vlm)
+        f_proc_y = 500.0 * (H_proc / H_vlm)
+        cx_proc = W_proc / 2.0
+        cy_proc = H_proc / 2.0
+        
+        # [!! 无需修改 !!] yolo_u, yolo_v 已经是 processed 空间的值
+        X_m = (yolo_u - cx_proc) * Z_m / f_proc_x
+        Y_m = (yolo_v - cy_proc) * Z_m / f_proc_y
+        
+        xyz_coords = {"x": X_m, "y": Y_m, "z": Z_m}
+        print(f"[_get_xyz_from_depth_model] 匹配成功! 目标 XYZ : {xyz_coords}")
+        
+        return xyz_coords
+      
+    def _project_3d_box_to_2d(self, bbox_3d, f, cx, cy, img_w, img_h):
+        """
+        (内部辅助) 将 LLM 返回的 3D bbox 投影到 2D 图像平面，计算 2D 中心点。
+        """
+        x_c, y_c, z_c = bbox_3d[0], bbox_3d[1], bbox_3d[2]
+        dx, dy, dz = bbox_3d[3], bbox_3d[4], bbox_3d[5]
+        roll, pitch, yaw = bbox_3d[6], bbox_3d[7], bbox_3d[8]
+
+        # 构建 3D 角点 (Local)
+        corners_local = np.array([
+            [dx/2, dy/2, dz/2], [dx/2, dy/2, -dz/2],
+            [dx/2, -dy/2, dz/2], [dx/2, -dy/2, -dz/2],
+            [-dx/2, dy/2, dz/2], [-dx/2, dy/2, -dz/2],
+            [-dx/2, -dy/2, dz/2], [-dx/2, -dy/2, -dz/2],
+        ])
+
+        # 旋转矩阵
+        R_x = np.array([[1, 0, 0], [0, np.cos(roll), -np.sin(roll)], [0, np.sin(roll), np.cos(roll)]])
+        R_y = np.array([[np.cos(pitch), 0, np.sin(pitch)], [0, 1, 0], [-np.sin(pitch), 0, np.cos(pitch)]])
+        R_z = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+        R = R_z @ R_y @ R_x
+
+        # 变换到相机坐标系
+        corners_3d = (R @ corners_local.T).T + np.array([x_c, y_c, z_c])
+
+        corners_2d = []
+        for corner in corners_3d:
+            if corner[2] <= 0: continue
+            u = int(f * corner[0] / corner[2] + cx)
+            v = int(f * corner[1] / corner[2] + cy)
+            corners_2d.append((u, v))
+
+        if not corners_2d:
+            return None, None
+
+        # 计算投影后的 2D 边界框中心
+        corners_2d = np.array(corners_2d)
+        min_u, min_v = np.min(corners_2d, axis=0)
+        max_u, max_v = np.max(corners_2d, axis=0)
+        
+        # 限制在图像范围内
+        min_u, min_v = max(0, min_u), max(0, min_v)
+        max_u, max_v = min(img_w, max_u), min(img_h, max_v)
+
+        center_x = (min_u + max_u) / 2
+        center_y = (min_v + max_v) / 2
+        
+        return (center_x, center_y), (min_u, min_v, max_u, max_v)
+
+    def _get_xyz_from_vlm_matching_yolo(self, image_bgr, target_yolo_box, use_depth_model: bool = False): # <-- 新增 use_depth_model
+        """
+        (内部辅助) 
+        根据 use_depth_model 标志，选择 VLM (LLM) 或 DepthAnythingV2 来获取 3D 坐标。
+        """
+        # import openai 
+
+        # ==========================================================
+        # 分支 1: 使用 DepthAnythingV2 模型 (新逻辑)
+        # ==========================================================
+        if use_depth_model:
+            print("[move_to_person_2] 正在使用 DepthAnythingV2 模型获取 3D 坐标...")
+            return self._get_xyz_from_depth_model(image_bgr, target_yolo_box)
+
+        # ==========================================================
+        # 分支 2: 使用 VLM (LLM) (原有逻辑)
+        # ==========================================================
+        print("[move_to_person_2] 正在使用 VLM (LLM) 获取 3D 坐标...")
+
+        # --- 1. 图像预处理 ---
+        H_full, W_full = image_bgr.shape[:2]
+        MAX_VLM_SIDE = 480
+        if W_full >= H_full:
+            W_vlm = MAX_VLM_SIDE
+            H_vlm = int(H_full * (MAX_VLM_SIDE / W_full))
+        else:
+            H_vlm = MAX_VLM_SIDE
+            W_vlm = int(W_full * (MAX_VLM_SIDE / H_full))
+        
+        img_vlm = cv2.resize(image_bgr, (W_vlm, H_vlm))
+        
+        # 计算 YOLO 坐标在 VLM 图像上的位置
+        scale_x = W_vlm / W_full
+        scale_y = H_vlm / H_full
+        yolo_cx = ((target_yolo_box[0] + target_yolo_box[2]) / 2) * scale_x
+        yolo_cy = ((target_yolo_box[1] + target_yolo_box[3]) / 2) * scale_y
+
+        # --- 2. 构建请求 ---
+        base64_rgb_str = _cv2_to_base64(img_vlm, ".png")
+        prompt = """
+        Detect all 'person' in the image.
+        - If no objects are found, return an empty JSON array: []
+        - If objects are found, output ONLY a valid JSON array in this format:
+        [{{"bbox_3d": [x_center, y_center, z_center, x_size, y_size, z_size, roll, pitch, yaw], "label": "person"}}]
+        
+        Important instructions:
+        1. Return ONLY the JSON array with no additional text.
+        2. Use empty array [] when no objects are detected.
+        3. For each object, provide 3D bounding box coordinates in meters relative to the camera.
+        4. Never output explanations or other text.
+        """
+        
+        print("[move_to_person_2] 正在调用 VLM 获取 3D 坐标...")
+        try:
+            start_time = time.time()
+            response = self.llm_client.chat.completions.create(
+                model=API_VL_MODEL,
+                messages=[
+                    { "role": "system", "content": "You are a spatial analysis assistant for a robot." },
+                    { "role": "user", "content": [ {"type": "text", "text": prompt}, { "type": "image_url", "image_url": { "url": f"data:image/png;base64,{base64_rgb_str}" } }, ], }
+                ],
+                temperature=0.0,
+            )
+            raw_response = response.choices[0].message.content
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            print(f"[move_to_person_2] VLM执行时间: {elapsed_time:.6f} 秒")  # 保留6位小数
+            print("[move_to_person_2] VLM返回: ", raw_response)
+            try:
+                result_list = json.loads(raw_response)
+            except json.JSONDecodeError:
+                start = raw_response.find("["); end = raw_response.rfind("]")
+                result_list = json.loads(raw_response[start:end+1]) if start != -1 else []
+
+        except openai.BadRequestError as e:
+            err_body = e.body or {}
+            if isinstance(err_body, dict) and err_body.get('code') == 'data_inspection_failed':
+                print(f"⚠️ [安全拦截] 阿里云认为图片包含敏感内容 (Error 400). 跳过此帧。")
+            else:
+                print(f"❌ [API 请求错误] 400 Bad Request: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ [VLM 未知错误] 调用失败: {e}")
+            return None
+
+        if not result_list:
+            print("[move_to_person_2] VLM 未返回任何 3D 物体。")
+            return None
+
+        # --- 3. 计算匹配逻辑 (第一轮循环：找最佳) ---
+        best_match_xyz = None
+        best_match_idx = -1
+        min_dist = float('inf')
+        
+        f = 500.0
+        cx, cy = W_vlm / 2, H_vlm / 2
+
+        print(f"[move_to_person_2] VLM 返回 {len(result_list)} 个候选框，正在计算最佳匹配...")
+        
+        # 预计算所有框的 2D 中心，方便后续画图和匹配
+        parsed_boxes = [] 
+
+        for idx, item in enumerate(result_list):
+            bbox_3d = item.get("bbox_3d")
+            if not bbox_3d or len(bbox_3d) < 9: 
+                parsed_boxes.append(None)
+                continue
+            
+            center_2d, _ = self._project_3d_box_to_2d(bbox_3d, f, cx, cy, W_vlm, H_vlm)
+            
+            parsed_boxes.append({"bbox_3d": bbox_3d, "center_2d": center_2d})
+
+            if center_2d:
+                dist = math.sqrt((center_2d[0] - yolo_cx)**2 + (center_2d[1] - yolo_cy)**2)
+                # 记录距离以便调试
+                item['_debug_dist'] = dist 
+                
+                # 判定阈值 (图像宽度的 1/4)
+                if dist < min_dist and dist < (W_vlm / 2):
+                    min_dist = dist
+                    best_match_idx = idx
+                    best_match_xyz = { "x": bbox_3d[0], "y": bbox_3d[1], "z": bbox_3d[2] }
+
+        # --- 4. 调试绘图 (第二轮循环：画所有框) ---
+        try:
+            debug_img = img_vlm.copy()
+            
+            # 绘制 YOLO 参考中心 (红色实心圆)
+            cv2.circle(debug_img, (int(yolo_cx), int(yolo_cy)), 6, (0, 0, 255), -1)
+            cv2.putText(debug_img, "YOLO Ref", (int(yolo_cx)+10, int(yolo_cy)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+            for idx, data in enumerate(parsed_boxes):
+                if data is None: continue
+                
+                bbox_3d = data["bbox_3d"]
+                
+                # 颜色选择: 最佳匹配 = 绿色 (0, 255, 0), 其他 = 蓝色 (255, 0, 0)
+                if idx == best_match_idx:
+                    color = (0, 255, 0) # Green
+                    thickness = 2
+                    label_prefix = "MATCH"
+                else:
+                    color = (255, 0, 0) # Blue
+                    thickness = 1
+                    label_prefix = "vlm"
+
+                # --- 绘制 3D 线框 ---
+                x_c, y_c, z_c = bbox_3d[0], bbox_3d[1], bbox_3d[2]
+                dx, dy, dz = bbox_3d[3], bbox_3d[4], bbox_3d[5]
+                roll, pitch, yaw = bbox_3d[6], bbox_3d[7], bbox_3d[8]
+
+                corners_local = np.array([
+                    [dx/2, dy/2, dz/2], [dx/2, dy/2, -dz/2],
+                    [dx/2, -dy/2, dz/2], [dx/2, -dy/2, -dz/2],
+                    [-dx/2, dy/2, dz/2], [-dx/2, dy/2, -dz/2],
+                    [-dx/2, -dy/2, dz/2], [-dx/2, -dy/2, -dz/2],
+                ])
+                R_x = np.array([[1,0,0],[0,np.cos(roll),-np.sin(roll)],[0,np.sin(roll),np.cos(roll)]])
+                R_y = np.array([[np.cos(pitch),0,np.sin(pitch)],[0,1,0],[-np.sin(pitch),0,np.cos(pitch)]])
+                R_z = np.array([[np.cos(yaw),-np.sin(yaw),0],[np.sin(yaw),np.cos(yaw),0],[0,0,1]])
+                R = R_z @ R_y @ R_x
+                corners_3d = (R @ corners_local.T).T + np.array([x_c, y_c, z_c])
+                
+                corners_2d_pts = []
+                for corner in corners_3d:
+                    if corner[2] <= 0: corners_2d_pts.append(None)
+                    else:
+                        u = int(f * corner[0] / corner[2] + cx)
+                        v = int(f * corner[1] / corner[2] + cy)
+                        corners_2d_pts.append((u, v))
+                
+                lines = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)]
+                valid_pts = []
+                for i, j in lines:
+                    if corners_2d_pts[i] is not None and corners_2d_pts[j] is not None:
+                        cv2.line(debug_img, corners_2d_pts[i], corners_2d_pts[j], color, thickness)
+                        valid_pts.append(corners_2d_pts[i])
+                        valid_pts.append(corners_2d_pts[j])
+                
+                # --- 绘制文字信息 ---
+                if valid_pts:
+                    pts_arr = np.array(valid_pts)
+                    cx_text = int(np.mean(pts_arr[:, 0]))
+                    cy_text = int(np.min(pts_arr[:, 1])) - 5
+                    
+                    dist_val = result_list[idx].get('_debug_dist', 9999)
+                    info_text = f"{label_prefix} Z={z_c:.1f}m Err={dist_val:.0f}"
+                    
+                    cv2.putText(debug_img, info_text, (max(0, cx_text-40), max(15, cy_text)), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+            # 保存图片 (只要 result_list 不为空，代码走到这里都会保存)
+            save_path = "temp_current_frame_xyz_2.png"
+            cv2.imwrite(save_path, debug_img)
+            print(f"[move_to_person_2] 调试图已保存 (含 {len(result_list)} 个框): {save_path}")
+
+        except Exception as e:
+            print(f"[move_to_person_2] 调试绘图失败: {e}")
+
+        # --- 5. 返回结果 ---
+        if best_match_xyz:
+            print(f"[move_to_person_2] 匹配成功! 目标 XYZ: {best_match_xyz}")
+            return best_match_xyz
+        else:
+            print("[move_to_person_2] 匹配失败: VLM 检测到了物体，但距离 YOLO 人脸中心太远。")
+            return None
+
+    def check_view_optimized(self, use_api: bool = True, api_provider: str = "baidu", debug_image_path: str = None, use_depth_model: bool = False):
+        """
+        Args:
+            use_api (bool): 是否使用 API。
+            api_provider (str): "baidu" 或 "ali"。
+            debug_image_path (str): 调试图片路径。
+            use_depth_model (bool): 是否使用本地深度模型替代VLM获取XYZ。
+        """
+        # 1. 获取图像
+        image_bgr = None
+        if debug_image_path:
+            if os.path.exists(debug_image_path):
+                print(f"[check_view_optimized] DEBUG模式: 读取本地图片: {debug_image_path}")
+                image_bgr = cv2.imread(debug_image_path)
+            else:
+                return None
+        else:
+            image_bgr = self.get_frame_vlm(res_param=-1)  #  YRJ
+            # image_bgr = self.get_frame_vlm_fake(res_param=-1) 
+        
+        if image_bgr is None: return None
+        
+        # 2. YOLO 检测
+        if self.yolo_model is None:
+            self.yolo_model = YOLO(self.yolo_model_path).to("cuda")
+        
+        start_time = time.time()
+        results = self.yolo_model.predict(source=image_bgr, classes=[0], conf=0.4, verbose=False)
+        if not results or len(results[0].boxes) == 0:
+            print("[move_to_person_2] YOLO 未检测到人脸。")
+            return None
+        
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"[move_to_person_2] YOLO 检测到 {len(results[0].boxes)} 个人脸。执行时间: {elapsed_time:.6f} 秒")
+
+        target_yolo_box = None 
+        ref_path = "/home/dji/LMFly/UAV-Isaac-GR00T/uav_script/person_A.jpg"
+
+        # 3. 验证循环
+        for i, box in enumerate(results[0].boxes.xyxy.cpu().numpy()):
+            x1, y1, x2, y2 = map(int, box)
+            face_crop = image_bgr[y1:y2, x1:x2]
+            if face_crop.size == 0: continue
+            
+            temp_crop_path = f"temp_face_check_{i}.png"
+            cv2.imwrite(temp_crop_path, face_crop)
+            is_match = False
+            
+            if use_api:
+                if api_provider == "ali":
+                    # --- 阿里 API ---
+                    ali_ak = ALIBABA_CLOUD_ACCESS_KEY_ID
+                    ali_sk = ALIBABA_CLOUD_ACCESS_KEY_SECRET
+                    config = AliConfig(access_key_id=ali_ak, access_key_secret=ali_sk, endpoint='facebody.cn-shanghai.aliyuncs.com', region_id='cn-shanghai')
+                    client = AliClient(config)
+                    req = CompareFaceAdvanceRequest()
+                    with open(ref_path, 'rb') as f1, open(temp_crop_path, 'rb') as f2:
+                        req.image_urlaobject = f1
+                        req.image_urlbobject = f2
+                        resp = client.compare_face_advance(req, RuntimeOptions())
+                        if hasattr(resp.body, 'data') and resp.body.data:
+                            score = resp.body.data.confidence
+                            if score > 60.0:
+                                print(f"  -> [Ali] 人脸 {i} 匹配成功 (Score: {score:.1f})")
+                                is_match = True
+                            else:
+                                print(f"  -> [Ali] 人脸 {i} 匹配失败 (Score: {score:.1f})")
+                   
+
+                else:
+                    # --- 百度 API ---
+                    try:
+                        with open(ref_path, 'rb') as f: ref_b64 = base64.b64encode(f.read()).decode()
+                        with open(temp_crop_path, 'rb') as f: cur_b64 = base64.b64encode(f.read()).decode()
+                        
+                        client = AipFace(_API_APP_ID, _API_KEY, _SECRET_KEY)
+                        images = [
+                            {'image': ref_b64, 'image_type': 'BASE64', 'face_type': 'LIVE', 'quality_control': 'LOW'},
+                            {'image': cur_b64, 'image_type': 'BASE64', 'face_type': 'LIVE', 'quality_control': 'LOW'}
+                        ]
+                        res = client.match(images)
+                        
+                        if res.get('error_code') == 0:
+                            score = res['result']['score']
+                            if score > 60.0: 
+                                print(f"  -> [API] 人脸 {i} 匹配成功 (Score: {score:.1f})")
+                                is_match = True
+                            else:
+                                print(f"  -> [API] 人脸 {i} 匹配失败 (Score: {score:.1f})")
+                        else:
+                            print(f"  -> [API] 错误: {res.get('error_msg')}")
+                    except Exception as e:
+                        print(f"  -> [API] 验证异常: {e}")
+
+            else:
+                # --- 本地 Local ---
                 try:
-                    self.socket.close()
+                    if self.inferencer is None:
+                        print("  -> [Local] 错误: 本地 Inferencer 未初始化。")
+                        continue
+
+                    start_time = time.time()
+                    feat_ref = self.inferencer.infer_from_image(ref_path)
+                    feat_cur = self.inferencer.infer_from_image(temp_crop_path)
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    
+                    if feat_ref is not None and feat_cur is not None:
+                        sim = self.inferencer.calculate_similarity(feat_ref, feat_cur)
+                        if sim > 0.3:
+                            print(f"  -> [Local] 人脸 {i} 匹配成功 (Sim: {sim:.3f})    执行时间: {elapsed_time:.6f} 秒")
+                            is_match = True
+                        else:
+                            print(f"  -> [Local] 人脸 {i} 匹配失败 (Sim: {sim:.3f})     执行时间: {elapsed_time:.6f} 秒")
                 except Exception as e:
-                    print(f"[shutdown] 关闭套接字时出错: {e}")
-                self.socket = None
-        print("DjiM4DDrone wrapper shutdown complete.")
+                    print(f"  -> [Local] 验证异常: {e}")
+
+            if is_match:
+                target_yolo_box = [x1, y1, x2, y2]
+                break 
+
+        if target_yolo_box is not None:
+            # [!!] 将 use_depth_model 标志传递下去
+            return self._get_xyz_from_vlm_matching_yolo(image_bgr, target_yolo_box, use_depth_model=use_depth_model)
+        
+        return None
+    
+    def move_to_person_2(self, target_distance_cm: int, target_height_cm: int = 0, use_api: bool = True, use_depth_model: bool = True) -> bool:
+        """
+        [move_to_person_2]
+        [优化版] 寻找并移动到 Person_A。
+        此版本强制使用 'DepthAnythingV2' (深度模型) 来获取 XYZ 坐标，而不是 VLM。
+
+        Args:
+            target_distance_cm: 目标距离
+            target_height_cm: 目标高度
+            use_api (bool): 是否使用在线 API 进行人脸识别 (默认为 True)
+        """
+        print(f"开始执行 move_to_person_2 (DepthAnythingV2 版): 目标 'person_A', 距离 {target_distance_cm}cm, API模式={'开' if use_api else '关'}")
+        
+        found_target_xyz = None
+        
+        # 原地旋转 6 次 (每次 60 度)
+        for i in range(6):
+            print(f"\n[move_to_person_2] 扫描角度 {i+1}/6 ...")
+            
+            # [!!] 关键区别: 强制 use_depth_model=True
+            result_3d = self.check_view_optimized(use_api=use_api, use_depth_model=use_depth_model)
+            
+            if result_3d:
+                found_target_xyz = result_3d
+                break
+            
+            print("[move_to_person_2] 当前视角未找到目标，逆时针旋转 60 度...")
+            self.turn_counter_clockwise(60)
+            time.sleep(1) 
+
+        if not found_target_xyz:
+            print("[move_to_person_2] 扫描结束，未找到 person_A。")
+            self.talk("未找到目标人物")
+            return False
+
+        # --- 移动逻辑 (与 move_to_person_2 相同) ---
+        x_m = found_target_xyz["x"]
+        y_m = found_target_xyz["y"]
+        z_m = found_target_xyz["z"]
+        
+        if z_m <= 0:
+            print(f"深度模型返回无效 Z 距离 ({z_m})。")
+            return False
+            
+        actions_taken = []
+        
+        # 1. 旋转 (X轴)
+        if abs(x_m) > 0.05:
+            angle_rad = math.atan(x_m / z_m)
+            angle_deg = int(math.degrees(angle_rad))
+            if angle_deg > 0:
+                self.turn_clockwise(angle_deg); actions_taken.append(f"右转{angle_deg}")
+            elif angle_deg < 0:
+                self.turn_counter_clockwise(abs(angle_deg)); actions_taken.append(f"左转{abs(angle_deg)}")
+
+        # 2. 高度 (Y轴)
+        vertical_error_m = y_m - (target_height_cm / 100.0)
+        move_z_cm = int(vertical_error_m * 100)
+        if abs(move_z_cm) > 5:
+            if move_z_cm > 0:
+                self.move_down(move_z_cm); actions_taken.append(f"下降{move_z_cm}")
+            else:
+                self.move_up(abs(move_z_cm)); actions_taken.append(f"上升{abs(move_z_cm)}")
+
+        # 3. 距离 (Z轴)
+        move_distance_cm = int(z_m * 100) - target_distance_cm
+        if abs(move_distance_cm) > 20:
+            if move_distance_cm > 0:
+                self.move_forward(min(move_distance_cm, 5000)); actions_taken.append(f"前进{move_distance_cm}")
+            else:
+                self.move_backward(min(abs(move_distance_cm), 5000)); actions_taken.append(f"后退{abs(move_distance_cm)}")
+
+        if actions_taken:
+            print("完成移动: " + ", ".join(actions_taken))
+            self.talk("已移动到目标人物面前")
+            return True
+        else:
+            print("已经在目标位置。")
+            return True
+
+        
+
